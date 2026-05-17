@@ -1,2107 +1,1420 @@
-/**
- * =================================================================================
- *     Cloudflare Worker 通用 Emby 反向代理脚本 (带 D1 统计版 + 别名快捷入口系统)
- * =================================================================================
- *
- * 版本: 3.0
- * 更新日志:
- * - 集成 D1 数据库统计功能
- * - 统计播放次数与获取链接次数
- * - 统计日期强制使用北京时间 (UTC+8)
- * - 集成前端页面
- * - 新增：别名快捷入口系统（URL Rewrite + 多线路选择）
- * - 新增：多线路加权随机选择
- * - 新增：自动 failover 机制
- * - 新增：后台管理面板 (/admin)
- * - 新增：线路健康检测
- *
- * 架构说明：
- *   用户请求 → alias 查询 → 线路选择 → rewrite 成旧格式 → 调用旧代理逻辑 → 原始流式代理继续工作
- *   原始代理核心逻辑完全保留，别名系统仅在外层做 URL Rewrite
- */
+const CURRENT_VERSION = '3.1-simplified';
 
-const MANUAL_REDIRECT_DOMAINS = [
-  'emby.bangumi.ca',
-  'aliyundrive.com',
-  'aliyundrive.net',
-  'aliyuncs.com',
-  'alicdn.com',
-  'aliyun.com',
-  'cdn.aliyundrive.com',
-  'xunlei.com',
-  'xlusercdn.com',
-  'xycdn.com',
-  'sandai.net',
-  'thundercdn.com',
-  '115.com',
-  '115cdn.com',
-  '115cdn.net',
-  'anxia.com',
-  '189.cn',
-  'mini189.cn',
-  'ctyunxs.cn',
-  'cloud.189.cn',
-  'tianyiyun.com',
-  'telecomjs.com',
-  'quark.cn',
-  'quarkdrive.cn',
-  'uc.cn',
-  'ucdrive.cn',
-  'xiaoya.pro',
-  'myqcloud.com',
-  'cloudfront.net',
-  'akamaized.net',
-  'fastly.net',
-  'hwcdn.net',
-  'bytecdn.cn',
-  'bdcdn.net'
+const OPTIMIZED_DOMAINS = [
+  { subdomain: 'proxy1', domain: 'cf.090227.xyz', name: 'CF优选-090227' },
+  { subdomain: 'proxy2', domain: 'cf.877774.xyz', name: 'CF优选-877774' },
+  { subdomain: 'proxy3', domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选' },
+  { subdomain: 'proxy4', domain: 'saas.sin.fan', name: 'MIYU优选' },
+  { subdomain: 'proxy5', domain: 'bestcf.030101.xyz', name: 'Mingyu优选' },
+  { subdomain: 'proxy6', domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选' },
+  { subdomain: 'proxy7', domain: 'cf.tencentapp.cn', name: '腾讯泛域名' },
+  { subdomain: 'proxy8', domain: 'www.visa.cn', name: 'Visa官方' },
+  { subdomain: 'proxy9', domain: 'mfa.gov.ua', name: '乌克兰外交部' },
+  { subdomain: 'proxy10', domain: 'www.shopify.com', name: 'Shopify官方' },
+  { subdomain: 'proxy11', domain: 'store.ubi.com', name: '育碧商店' },
+  { subdomain: 'proxy12', domain: 'staticdelivery.nexusmods.com', name: 'NexusMods' },
 ];
 
-const DOMAIN_PROXY_RULES = {
-  // 'your-domain.com': 'target-domain.com',  // 示例：自定义域名转发规则
-};
+const RESERVED_ALIASES = new Set([
+  'admin', 'stats', 'health', 'api', 'favicon.ico', 'cdn-cgi',
+  '__client_rtt__', 'web', 'emby', 'sessions', 'playbackinfo',
+]);
 
+const MANUAL_REDIRECT_DOMAINS = [
+  'emby.bangumi.ca', 'aliyundrive.com', 'aliyundrive.net', 'aliyuncs.com', 'alicdn.com', 'aliyun.com',
+  'cdn.aliyundrive.com', 'xunlei.com', 'xlusercdn.com', 'xycdn.com', 'sandai.net', 'thundercdn.com',
+  '115.com', '115cdn.com', '115cdn.net', 'anxia.com', '189.cn', 'mini189.cn', 'ctyunxs.cn',
+  'cloud.189.cn', 'tianyiyun.com', 'telecomjs.com', 'quark.cn', 'quarkdrive.cn', 'uc.cn', 'ucdrive.cn',
+  'xiaoya.pro', 'myqcloud.com', 'cloudfront.net', 'akamaized.net', 'fastly.net', 'hwcdn.net', 'bytecdn.cn', 'bdcdn.net',
+];
+
+const DOMAIN_PROXY_RULES = { 'biliblili.uk': 'example.com' };
 const JP_COLOS = ['NRT', 'KIX', 'FUK', 'OKA'];
 
 const blocker = {
-  keys: [".m3u8", ".ts", ".acc", ".m4s", "photocall.tv", "googlevideo.com"],
-  check: function (url) {
-      url = url.toLowerCase();
-      let len = blocker.keys.filter(x => url.includes(x)).length;
-      return len != 0;
-  }
-};
-
-const PREFLIGHT_INIT = {
-  status: 204,
-  headers: new Headers({
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "*"
-  })
+  keys: ['.m3u8', '.ts', '.acc', '.m4s', 'photocall.tv', 'googlevideo.com'],
+  check(url) {
+    url = url.toLowerCase();
+    return blocker.keys.some((x) => url.includes(x));
+  },
 };
 
 const CONFIG = {
-    pikpakProxyUrl: 'https://your-pikpak-proxy.com',  // 如需 PikPak 代理，请修改此处
-    enableStats: true,
-    cacheEnabled: true,
-    rateLimit: {
-        maxRequests: 1000,
-        windowMs: 60000
-    }
+  pikpakProxyUrl: 'https://pp.255432.xyz',
+  enableStats: true,
+  cacheEnabled: true,
+  domainCacheTtlMs: 3600000,
 };
 
 const PIKPAK_DOMAINS = [
-    'pikpak.com', 'pikpak.net', 'pikpak-cn.com', 'pikpakcdn.com',
-    'pikpakapi.com', 'pikpakdrive.com'
+  'pikpak.com', 'pikpak.net', 'pikpak-cn.com', 'pikpakcdn.com', 'pikpakapi.com', 'pikpakdrive.com',
 ];
 
-// ===== 新增：别名系统常量 =====
-const ALIAS_MAX_RETRIES = 3;
-// 注意：以下配置项已从环境变量读取，请在 Cloudflare Worker 设置中配置环境变量：
-// ADMIN_PASSWORD - 管理员密码
-// CF_API_TOKEN - Cloudflare API Token（需 DNS:Edit 权限）
-// CF_ZONE_ID - 域名 Zone ID
-// BASE_DOMAIN - 基础域名（如 example.com）
+const CORS_JSON = { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' };
 
-// ===== 新增：智能选线系统 =====
-// 优选线路配置：每个子域名对应一个优选域名
-// 需要在 Cloudflare DNS 中为每个子域名创建 CNAME 记录指向对应的优选域名
-// 并在 Worker 路由中绑定 *.example.com/*
-const SPEED_LINES = [
-    { subdomain: 'proxy1', domain: 'cf.090227.xyz',       name: 'CF优选-090227' },
-    { subdomain: 'proxy2', domain: 'cf.877774.xyz',        name: 'CF优选-877774' },
-    { subdomain: 'proxy3', domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选' },
-    { subdomain: 'proxy4', domain: 'saas.sin.fan',         name: 'MIYU优选' },
-    { subdomain: 'proxy5', domain: 'bestcf.030101.xyz',    name: 'Mingyu优选' },
-    { subdomain: 'proxy6', domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选' },
-    { subdomain: 'proxy7', domain: 'cf.tencentapp.cn',     name: '腾讯泛域名' },
-    { subdomain: 'proxy8', domain: 'www.visa.cn',          name: 'Visa官方' },
-    { subdomain: 'proxy9', domain: 'mfa.gov.ua',           name: '乌克兰外交部' },
-    { subdomain: 'proxy10', domain: 'www.shopify.com',     name: 'Shopify官方' },
-    { subdomain: 'proxy11', domain: 'store.ubi.com',       name: '育碧商店' },
-    { subdomain: 'proxy12', domain: 'staticdelivery.nexusmods.com', name: 'NexusMods' },
-];
-const SPEED_CACHE_TTL = 3600;  // 缓存1小时
+let dbReady = false;
 
-// 自动创建智能选线 DNS 记录（部署后自动调用）
-async function ensureSpeedDnsRecords(env) {
-    var apiToken = env.CF_API_TOKEN;
-    var zoneId = env.CF_ZONE_ID;
-    var baseDomain = env.BASE_DOMAIN;
-    if (!apiToken || !zoneId || !baseDomain) {
-        console.log('[智能选线DNS] 未配置 CF_API_TOKEN/CF_ZONE_ID/BASE_DOMAIN，跳过自动创建');
-        return;
-    }
-
-    for (var i = 0; i < SPEED_LINES.length; i++) {
-        var line = SPEED_LINES[i];
-        var fullName = line.subdomain + '.' + baseDomain;
-        try {
-            // 检查是否已存在
-            var checkRes = await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records?name=' + encodeURIComponent(fullName), {
-                headers: { 'Authorization': 'Bearer ' + apiToken, 'Content-Type': 'application/json' }
-            });
-            var checkData = await checkRes.json();
-            if (checkData.success && checkData.result && checkData.result.length > 0) {
-                console.log('[智能选线DNS] 已存在:', fullName, '->', line.domain);
-                continue;
-            }
-            // 创建 CNAME 记录
-            var createRes = await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records', {
-                method: 'POST',
-                headers: { 'Authorization': 'Bearer ' + apiToken, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ type: 'CNAME', name: fullName, content: line.domain, proxied: true })
-            });
-            var createData = await createRes.json();
-            if (createData.success) {
-                console.log('[智能选线DNS] 创建成功:', fullName, '->', line.domain);
-            } else {
-                console.error('[智能选线DNS] 创建失败:', fullName, createData.errors);
-            }
-        } catch (e) {
-            console.error('[智能选线DNS] 异常:', fullName, e.message);
-        }
-    }
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: CORS_JSON });
 }
 
-// ===== DNS 日志系统 =====
-var dnsLogs = [];
-function addDnsLog(type, message, data) {
-    var log = {
-        time: new Date().toISOString(),
-        type: type,
-        message: message,
-        data: data
-    };
-    dnsLogs.unshift(log);
-    if (dnsLogs.length > 100) dnsLogs.pop();
-    console.log('[DNS LOG]', type, message, data);
+function html(body, status = 200) {
+  return new Response(body, { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-// ===== 智能选线：测速页面 HTML =====
-const SPEED_TEST_HTML = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>线路测速中...</title>
-  <style>
-    :root { --primary: #0a84ff; --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --text-sec: #98989d; --border: #38383a; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-    .container { width: 100%; max-width: 500px; padding: 20px; }
-    .card { background: var(--card); border-radius: 16px; padding: 30px; border: 1px solid var(--border); }
-    h2 { color: var(--primary); font-size: 18px; margin-bottom: 20px; text-align: center; }
-    .line-item { display: flex; align-items: center; padding: 12px 14px; border-radius: 10px; background: rgba(255,255,255,0.03); margin-bottom: 8px; border: 1px solid var(--border); gap: 10px; }
-    .line-name { flex: 1; font-size: 14px; }
-    .line-status { font-size: 13px; color: var(--text-sec); min-width: 60px; text-align: right; }
-    .line-status.done { color: #30d158; }
-    .line-status.fail { color: #ff453a; }
-    .line-status.testing { color: var(--primary); }
-    .line-status.best { color: #ff9f0a; font-weight: bold; }
-    .progress { height: 3px; background: var(--border); border-radius: 2px; margin-top: 20px; overflow: hidden; }
-    .progress-bar { height: 100%; background: var(--primary); border-radius: 2px; transition: width 0.3s; width: 0%; }
-    .redirect-msg { text-align: center; margin-top: 16px; font-size: 14px; color: var(--text-sec); display: none; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="card">
-      <h2>正在为您选择最优线路</h2>
-      <div id="lines"></div>
-      <div class="progress"><div class="progress-bar" id="progress"></div></div>
-      <div class="redirect-msg" id="redirect-msg">即将跳转...</div>
-    </div>
-  </div>
-  <script>
-    var LINES = __SPEED_LINES__;
-    var TARGET = __TARGET_URL__;
-    var REPORT_API = '/__speed_report';
-    var results = [];
-    var done = 0;
-    var total = LINES.length;
-
-    function render() {
-      var c = document.getElementById('lines');
-      var html = '';
-      for (var i = 0; i < LINES.length; i++) {
-        var line = LINES[i];
-        var r = results[i];
-        var statusClass = 'testing';
-        var statusText = '测速中...';
-        if (r) {
-          if (r.ok) { statusClass = 'done'; statusText = r.ms + 'ms'; }
-          else { statusClass = 'fail'; statusText = '超时'; }
-          if (r.best) { statusClass = 'best'; statusText = r.ms + 'ms ✓'; }
-        }
-        html += '<div class="line-item"><span class="line-name">' + line.name + '</span><span class="line-status ' + statusClass + '">' + statusText + '</span></div>';
-      }
-      c.innerHTML = html;
-      document.getElementById('progress').style.width = Math.round(done / total * 100) + '%';
-    }
-
-    function testLine(index) {
-      var line = LINES[index];
-      var url = 'https://' + line.subdomain + '.' + window.location.hostname + '/__speed_ping';
-      var start = Date.now();
-      var controller = new AbortController();
-      var tid = setTimeout(function() { controller.abort(); }, 5000);
-
-      fetch(url, { method: 'HEAD', mode: 'no-cors', cache: 'no-cache', signal: controller.signal })
-        .then(function() {
-          clearTimeout(tid);
-          results[index] = { ok: true, ms: Date.now() - start };
-        })
-        .catch(function() {
-          clearTimeout(tid);
-          results[index] = { ok: false, ms: 9999 };
-        })
-        .then(function() {
-          done++;
-          render();
-          if (done === total) finish();
-        });
-    }
-
-    function finish() {
-      // 找最优
-      var bestIdx = -1, bestMs = Infinity;
-      for (var i = 0; i < results.length; i++) {
-        if (results[i] && results[i].ok && results[i].ms < bestMs) {
-          bestMs = results[i].ms;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx >= 0) {
-        results[bestIdx].best = true;
-        render();
-        // 上报
-        var reportData = [];
-        for (var i = 0; i < results.length; i++) {
-          reportData.push({ subdomain: LINES[i].subdomain, ms: results[i] ? results[i].ms : -1, ok: results[i] ? results[i].ok : false });
-        }
-        fetch(REPORT_API, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ best: LINES[bestIdx].subdomain, results: reportData })
-        }).catch(function() {});
-
-        // 跳转
-        var redirectUrl = 'https://' + LINES[bestIdx].subdomain + '.' + window.location.hostname + TARGET;
-        document.getElementById('redirect-msg').style.display = 'block';
-        setTimeout(function() { window.location.replace(redirectUrl); }, 600);
-      } else {
-        document.getElementById('redirect-msg').textContent = '所有线路不可用，请稍后重试';
-        document.getElementById('redirect-msg').style.display = 'block';
-      }
-    }
-
-    render();
-    for (var i = 0; i < total; i++) testLine(i);
-  </script>
-</body>
-</html>
-`;
-
-// ===== 智能选线：核心逻辑函数 =====
-
-// 确保缓存表存在
-async function ensureSpeedCacheTable(env) {
-    if (!env.DB) return false;
-    try {
-        await env.DB.prepare(`
-            CREATE TABLE IF NOT EXISTS speed_region_cache (
-                region_code TEXT,
-                asn TEXT,
-                best_subdomain TEXT,
-                latency INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                expires_at DATETIME,
-                PRIMARY KEY (region_code, asn)
-            )
-        `).run();
-        return true;
-    } catch (e) {
-        console.error('[智能选线] 创建缓存表失败:', e);
-        return false;
-    }
+function getCookie(req, name) {
+  const s = req.headers.get('Cookie');
+  if (!s) return null;
+  const m = s.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return m ? decodeURIComponent(m[2]) : null;
 }
 
-// 获取用户网络信息
-function getUserNetworkInfo(request) {
-    var country = (request.headers.get('cf-ipcountry') || 'XX').toUpperCase();
-    var asn = 'AS' + (request.headers.get('cf-asn') || '0');
-    return { regionCode: country, asn: asn };
+function getAdminToken(env) {
+  const raw = env.ADMIN_TOKEN ?? env.ADMIN_PASSWORD ?? env.admin_token ?? env.AdminToken;
+  if (raw == null) return null;
+  const t = String(raw).trim();
+  return t.length ? t : null;
 }
 
-// 查询缓存
-async function getSpeedCache(env, regionCode, asn) {
-    if (!env.DB) return null;
-    try {
-        var now = new Date().toISOString();
-        return await env.DB.prepare(
-            'SELECT best_subdomain, latency FROM speed_region_cache WHERE region_code = ? AND asn = ? AND expires_at > ?'
-        ).bind(regionCode, asn, now).first();
-    } catch (e) {
-        console.error('[智能选线] 查询缓存失败:', e);
-        return null;
-    }
+function isAdmin(request, env) {
+  const expected = getAdminToken(env);
+  if (!expected) return false;
+  const provided = getCookie(request, 'admin_token');
+  return provided === expected;
 }
 
-// 写入缓存
-async function setSpeedCache(env, regionCode, asn, bestSubdomain, latency) {
-    if (!env.DB) return;
-    try {
-        var now = new Date();
-        var expires = new Date(now.getTime() + SPEED_CACHE_TTL * 1000).toISOString();
-        await env.DB.prepare(`
-            INSERT INTO speed_region_cache (region_code, asn, best_subdomain, latency, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(region_code, asn) DO UPDATE SET
-                best_subdomain = excluded.best_subdomain,
-                latency = excluded.latency,
-                created_at = excluded.created_at,
-                expires_at = excluded.expires_at
-        `).bind(regionCode, asn, bestSubdomain, latency, now.toISOString(), expires).run();
-        console.log('[智能选线] 缓存写入:', regionCode, asn, '->', bestSubdomain, latency + 'ms');
-    } catch (e) {
-        console.error('[智能选线] 写入缓存失败:', e);
-    }
+function adminLoginResponse(request, env, tokenFromUser) {
+  const expected = getAdminToken(env);
+  if (!expected) {
+    return json({
+      ok: false,
+      error: 'Worker 未读到 ADMIN_TOKEN。请在 Cloudflare 控制台 → Worker → 设置 → 变量和机密 中添加 ADMIN_TOKEN。',
+    }, 503);
+  }
+  if (tokenFromUser !== expected) {
+    return json({ ok: false, error: '密钥错误' }, 401);
+  }
+  const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
+  const cookie = `admin_token=${encodeURIComponent(expected)}; Path=/; Max-Age=2592000; SameSite=Lax${secure}`;
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Set-Cookie': cookie,
+      'Cache-Control': 'no-store',
+    },
+  });
 }
 
-// 处理智能选线入口（proxy.your-domain.com/emby.com）
-async function handleSmartRoute(request, env, ctx, targetPath) {
-    await ensureSpeedCacheTable(env);
+function getClientCacheKey(request) {
+  const ip = request.headers.get('cf-connecting-ip') || '0.0.0.0';
+  const cf = request.cf || {};
+  let ipKey = ip;
+  if (ip.includes('.')) ipKey = ip.split('.').slice(0, 3).join('.');
+  else if (ip.includes(':')) ipKey = ip.split(':').slice(0, 4).join(':');
+  return `${cf.country || 'XX'}|${cf.city || ''}|${cf.asn || ''}|${ipKey}`;
+}
 
-    var netInfo = getUserNetworkInfo(request);
-    console.log('[智能选线] 用户:', netInfo.regionCode, netInfo.asn, '目标:', targetPath);
+function optimizedHost(item) {
+  return `${item.subdomain}.${item.domain}`;
+}
 
-    // 1. 查缓存
-    var cached = await getSpeedCache(env, netInfo.regionCode, netInfo.asn);
-    if (cached) {
-        console.log('[智能选线] 缓存命中 ->', cached.best_subdomain, cached.latency + 'ms');
-        // 302 重定向到最优子域名
-        var baseDomain = env.BASE_DOMAIN || request.headers.get('host');
-        baseDomain = baseDomain.split(':')[0];
-        var redirectUrl = 'https://' + cached.best_subdomain + '.' + baseDomain + '/' + targetPath;
-        return Response.redirect(redirectUrl, 302);
+function latencyStatus(ms) {
+  if (ms < 0) return 'timeout';
+  if (ms < 100) return 'fast';
+  if (ms < 300) return 'good';
+  return 'slow';
+}
+
+async function initDatabase(env) {
+  if (!env.DB || dbReady) return;
+  await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS routes (
+      prefix TEXT PRIMARY KEY, target TEXT NOT NULL,
+      remark TEXT DEFAULT '', last_play TEXT DEFAULT '',
+      cache_img TEXT DEFAULT 'on', compat_mode TEXT DEFAULT 'off',
+      sort_order INTEGER DEFAULT 0, target_latencies TEXT DEFAULT '')`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS visitor_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, ua TEXT)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS request_stats (
+      prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date))`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS auto_emby_daily_stats (
+      date TEXT PRIMARY KEY, playing_count INTEGER DEFAULT 0, playback_info_count INTEGER DEFAULT 0)`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS domain_speed_cache (
+      cache_key TEXT NOT NULL, subdomain TEXT NOT NULL, domain TEXT NOT NULL,
+      display_name TEXT, latency_ms INTEGER DEFAULT -1, status TEXT DEFAULT 'unknown',
+      tested_at INTEGER NOT NULL, PRIMARY KEY (cache_key, subdomain, domain))`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS domain_best_cache (
+      cache_key TEXT PRIMARY KEY, best_host TEXT, best_name TEXT, best_latency INTEGER,
+      tested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`),
+  ]);
+  try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN target_latencies TEXT DEFAULT ''`); } catch(e) {}
+  try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN compat_mode TEXT DEFAULT 'off'`); } catch(e) {}
+  dbReady = true;
+}
+
+async function getEdgeInfo(request) {
+  const cf = request.cf || {};
+  let traceIp = '';
+  let traceColo = cf.colo || '未知';
+  try {
+    const tr = await fetch('https://1.1.1.1/cdn-cgi/trace', { headers: { 'User-Agent': 'CF-Worker-Trace' } });
+    const text = await tr.text();
+    const coloM = text.match(/colo=([A-Z0-9]+)/);
+    const ipM = text.match(/ip=([^\n]+)/);
+    if (coloM) traceColo = coloM[1];
+    if (ipM) traceIp = ipM[1].trim();
+  } catch (_) {}
+  return {
+    clientIp: request.headers.get('cf-connecting-ip') || '未知',
+    entryColo: cf.colo || '未知',
+    entryCountry: cf.country || '未知',
+    entryCity: cf.city || '',
+    edgeIp: traceIp || '—',
+    egressColo: traceColo,
+    cacheKey: getClientCacheKey(request),
+  };
+}
+
+async function speedtestUrl(urlStr, timeoutMs = 5000) {
+  const start = Date.now();
+  try {
+    const u = new URL(urlStr.startsWith('http') ? urlStr : 'https://' + urlStr);
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(u.origin + '/', { method: 'HEAD', signal: ctrl.signal, redirect: 'manual' });
+    clearTimeout(tid);
+    if (res.status === 502 || res.status === 503 || res.status === 504) return -1;
+    return Date.now() - start;
+  } catch {
+    return -1;
+  }
+}
+
+async function speedtestOptimizedFromEdge() {
+  const results = [];
+  for (const item of OPTIMIZED_DOMAINS) {
+    const host = optimizedHost(item);
+    const ms = await speedtestUrl(`https://${host}/cdn-cgi/trace`, 4000);
+    results.push({
+      subdomain: item.subdomain, domain: item.domain, name: item.name, host,
+      latency: ms, status: latencyStatus(ms),
+    });
+  }
+  results.sort((a, b) => {
+    if (a.latency < 0 && b.latency < 0) return 0;
+    if (a.latency < 0) return 1;
+    if (b.latency < 0) return -1;
+    return a.latency - b.latency;
+  });
+  const best = results.find((r) => r.latency >= 0);
+  return { results, best: best ? best.host : null };
+}
+
+async function speedtestRouteTargets(env, prefix) {
+  const route = await env.DB.prepare('SELECT * FROM routes WHERE prefix = ?').bind(prefix).first();
+  if (!route) return [];
+  const targets = route.target.split(',').map(s => s.trim()).filter(Boolean);
+  const latencies = {};
+  const out = [];
+  for (const t of targets) {
+    const ms = await speedtestUrl(t);
+    latencies[t] = ms;
+    out.push({ url: t, latency: ms, status: latencyStatus(ms) });
+  }
+  await env.DB.prepare('UPDATE routes SET target_latencies = ? WHERE prefix = ?')
+    .bind(JSON.stringify(latencies), prefix).run();
+  out.sort((a, b) => {
+    if (a.latency < 0 && b.latency < 0) return 0;
+    if (a.latency < 0) return 1;
+    if (b.latency < 0) return -1;
+    return a.latency - b.latency;
+  });
+  return out;
+}
+
+async function speedtestAllRoutes(env) {
+  const { results: routes } = await env.DB.prepare('SELECT prefix, target FROM routes ORDER BY sort_order, prefix').all();
+  const allResults = {};
+  for (const route of routes || []) {
+    const targets = route.target.split(',').map(s => s.trim()).filter(Boolean);
+    const latencies = {};
+    for (const t of targets) {
+      const ms = await speedtestUrl(t);
+      latencies[t] = ms;
     }
-
-    // 2. 无缓存，返回测速页面
-    console.log('[智能选线] 缓存未命中，返回测速页面');
-    var baseDomain = env.BASE_DOMAIN || request.headers.get('host');
-    baseDomain = baseDomain.split(':')[0];
-
-    // 构建线路列表 JSON（供前端 JS 使用）
-    var linesJson = JSON.stringify(SPEED_LINES.map(function(l) {
-        return { subdomain: l.subdomain, name: l.name + ' (' + l.domain + ')' };
+    await env.DB.prepare('UPDATE routes SET target_latencies = ? WHERE prefix = ?')
+      .bind(JSON.stringify(latencies), route.prefix).run();
+    allResults[route.prefix] = Object.entries(latencies).map(([url, latency]) => ({
+      url, latency, status: latencyStatus(latency),
     }));
-
-    var html = SPEED_TEST_HTML
-        .replace('__SPEED_LINES__', linesJson)
-        .replace('__TARGET_URL__', '/' + targetPath);
-
-    return new Response(html, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-    });
+  }
+  return allResults;
 }
 
-// 处理测速 ping 端点（/__speed_ping）
-function handleSpeedPing() {
-    return new Response('', { status: 204 });
+async function saveDomainSpeedCache(env, cacheKey, rows) {
+  const now = Date.now();
+  const expires = now + CONFIG.domainCacheTtlMs;
+  const stmts = [];
+  for (const r of rows) {
+    stmts.push(env.DB.prepare(
+      `INSERT INTO domain_speed_cache (cache_key, subdomain, domain, display_name, latency_ms, status, tested_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(cache_key, subdomain, domain) DO UPDATE SET
+       latency_ms=excluded.latency_ms, status=excluded.status, tested_at=excluded.tested_at`
+    ).bind(cacheKey, r.subdomain, r.domain, r.name || r.display_name, r.latency, r.status, now));
+  }
+  const sorted = [...rows].filter((r) => r.latency >= 0).sort((a, b) => a.latency - b.latency);
+  const best = sorted[0];
+  if (best) {
+    const host = `${best.subdomain}.${best.domain}`;
+    stmts.push(env.DB.prepare(
+      `INSERT INTO domain_best_cache (cache_key, best_host, best_name, best_latency, tested_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET
+       best_host=excluded.best_host, best_name=excluded.best_name, best_latency=excluded.best_latency,
+       tested_at=excluded.tested_at, expires_at=excluded.expires_at`
+    ).bind(cacheKey, host, best.name || best.display_name, best.latency, now, expires));
+  }
+  await env.DB.batch(stmts);
 }
 
-// 处理测速结果上报（/__speed_report）
-async function handleSpeedReport(request, env) {
-    try {
-        var body = await request.json();
-        var bestSubdomain = body.best;
-        var testResults = body.results || [];
-
-        // 获取用户网络信息
-        var netInfo = getUserNetworkInfo(request);
-
-        // 找到最优线路的延迟
-        var bestLatency = 0;
-        for (var i = 0; i < testResults.length; i++) {
-            if (testResults[i].subdomain === bestSubdomain) {
-                bestLatency = testResults[i].ms;
-                break;
-            }
-        }
-
-        // 写入缓存
-        await setSpeedCache(env, netInfo.regionCode, netInfo.asn, bestSubdomain, bestLatency);
-
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' }
-        });
-    }
+async function loadDomainSpeedCache(env, cacheKey) {
+  const now = Date.now();
+  const best = await env.DB.prepare(
+    'SELECT * FROM domain_best_cache WHERE cache_key = ? AND expires_at > ?'
+  ).bind(cacheKey, now).first();
+  if (!best) return null;
+  const { results } = await env.DB.prepare(
+    'SELECT subdomain, domain, display_name, latency_ms, status, tested_at FROM domain_speed_cache WHERE cache_key = ? ORDER BY latency_ms ASC'
+  ).bind(cacheKey).all();
+  if (!results?.length) return null;
+  return {
+    cached: true,
+    cacheKey,
+    best: best.best_host,
+    bestName: best.best_name,
+    results: results.map((r) => ({
+      subdomain: r.subdomain, domain: r.domain, name: r.display_name, host: `${r.subdomain}.${r.domain}`,
+      latency: r.latency_ms, status: r.status,
+    })),
+    expiresAt: best.expires_at,
+  };
 }
 
-// ===== 前端页面HTML（原始，未修改） =====
-const FRONTEND_HTML = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Emby 反代工具指南 | 声明</title>
-  <link rel="icon" href="/favicon.ico" type="image/webp">
-  <style>
-    * { box-sizing: border-box; }
-    body { font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; color: #f5f5f7; margin: 0; padding: 0; background-color: #000; display: flex; min-height: 100vh; }
-    .container { width: 100%; max-width: 860px; margin: auto; padding: 30px 20px; display: flex; flex-direction: column; gap: 24px; }
-    .content-section { background: #1c1c1e; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); border: 1px solid #38383a; position: relative; overflow: hidden; }
-    .content-section::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #0a84ff, #5e5ce6); }
-    .content-section h1 { margin-top: 0; color: #0a84ff; display: flex; align-items: center; font-size: 28px; font-weight: 700; }
-    h2 { color: #0a84ff; border-bottom: 1px solid #38383a; padding-bottom: 12px; margin-top: 36px; font-size: 20px; font-weight: 600; }
-    code { background: rgba(10, 132, 255, 0.15); padding: 4px 8px; border-radius: 6px; font-family: 'Fira Code', ui-monospace, monospace; font-size: 0.9em; color: #64d2ff; word-break: break-all; border: 1px solid rgba(10, 132, 255, 0.2); }
-    .example-box { background: rgba(10, 132, 255, 0.05); border-left: 4px solid #0a84ff; padding: 20px; margin: 16px 0; border-radius: 0 12px 12px 0; }
-    .warning { color: #ff453a; font-weight: 500; border: 1px solid rgba(255, 69, 58, 0.3); padding: 20px; border-radius: 12px; margin-top: 40px; background: rgba(255, 69, 58, 0.08); display: flex; align-items: flex-start; gap: 12px; }
-    .strong-red { color: #ff453a; font-weight: 700; text-decoration: underline; font-size: 1.05em; }
-    .status-tag { display: inline-block; background: linear-gradient(135deg, #0a84ff, #0061cc); color: white; padding: 4px 12px; border-radius: 20px; font-weight: 600; margin-bottom: 16px; font-size: 14px; letter-spacing: 0.5px; }
-    .feature-card { background: rgba(255, 255, 255, 0.03); border-radius: 16px; padding: 24px; margin: 20px 0; border: 1px solid #38383a; transition: transform 0.2s, background 0.2s; }
-    .feature-card:hover { transform: translateY(-2px); background: rgba(255, 255, 255, 0.05); border-color: #0a84ff; }
-    .feature-card h3 { color: #0a84ff; margin-top: 0; font-size: 18px; margin-bottom: 12px; }
-    .feature-card p { margin-bottom: 0; color: #98989d; font-size: 15px; }
-    .footer-text { margin-top: 40px; padding-top: 24px; border-top: 1px dashed #38383a; font-size: 14px; color: #98989d; text-align: center; }
-    .footer-text p { margin: 6px 0; }
-    .stat-card { background: #2c2c2e; padding: 24px; border-radius: 16px; text-align: center; flex: 1; margin: 0 8px; border: 1px solid #38383a; }
-    .stat-card:first-child { margin-left: 0; }
-    .stat-card:last-child { margin-right: 0; }
-    .stat-card h3 { margin: 0; font-size: 15px; color: #98989d; font-weight: 500; }
-    .stat-value { font-size: 2.5em; font-weight: 700; color: #0a84ff; margin-top: 12px; font-family: "SF Pro Rounded", sans-serif; }
-    #daily-stats { background: #2c2c2e; border-radius: 16px; padding: 0; overflow-x: auto; border: 1px solid #38383a; margin-top: 20px; }
-    .stats-table { width: 100%; border-collapse: collapse; text-align: left; }
-    .stats-table th, .stats-table td { padding: 14px 20px; border-bottom: 1px solid #38383a; font-size: 15px; }
-    .stats-table th { background: rgba(10, 132, 255, 0.1); font-weight: 600; color: #0a84ff; text-transform: uppercase; letter-spacing: 0.5px; font-size: 13px; }
-    .stats-table tr:last-child td { border-bottom: none; }
-    .stats-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
-    @media (max-width: 900px) { 
-      .container { padding: 16px; } 
-      .content-section { padding: 24px; border-radius: 16px; } 
-      .stat-card { margin: 6px 0; padding: 20px; } 
-      .stats-container { flex-direction: column; } 
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="content-section" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap; gap: 16px;">
-      <h1 style="margin:0; font-size: 24px;">🚀 代理服务指南</h1>
-      <a href="/admin" style="background:#0a84ff;color:white;padding:10px 24px;border-radius:12px;text-decoration:none;font-weight:600;font-size:15px;transition:0.2s;box-shadow:0 4px 12px rgba(10,132,255,0.3);">🔐 管理后台</a>
-    </div>
-    <div class="content-section">
-      <div class="status-tag">服务状态：运行中</div>
-      <h1>🔧 Emby 反向代理</h1>
-      <p style="color: #98989d; font-size: 16px; margin-bottom: 24px;">本服务提供高性能的反向代理与链路优化，支持直接路径代理与别名快捷入口系统。</p>
-      
-      <div class="feature-card">
-        <h3>✨ 别名快捷入口 (新功能)</h3>
-        <p>支持在管理后台配置别名（如将 <code>emby.example.com</code> 映射为别名 <code>myemby</code>）。<br>
-        配置后直接访问 <code>https://proxy.domain.com/myemby</code> 即可自动路由，并且支持配置多条优选线路与自动故障转移 (Failover)！</p>
-      </div>
-
-      <h2>直接路径反代示例</h2>
-      <div class="example-box">
-        <code id="example-format-1">https://proxy.your-domain.com/你的域名:端口</code><br>
-        <code id="example-format-2" style="display:inline-block; margin-top:10px;">https://proxy.your-domain.com/http://你的域名:端口</code><br>
-        <code id="example-format-3" style="display:inline-block; margin-top:10px;">https://proxy.your-domain.com/https://你的域名:端口</code>
-      </div>
-
-      <div class="warning">
-        <div style="font-size: 24px;">⚠️</div>
-        <div>
-          <strong>严正警告：</strong><br>
-          <span style="color: #98989d; font-size: 14px; display: inline-block; margin-top: 6px;">
-            添加服务后 <span class="strong-red">务必手动测试</span> 是否可用。禁止未经测试大批量添加，导致服务器报错刷屏、恶意占用资源者，<span class="strong-red">直接封禁 IP，不予通知！</span>
-          </span>
-        </div>
-      </div>
-    </div>
-    <div class="content-section" id="stats-section">
-      <h2>📈 使用统计</h2>
-      <div id="stats-loading" style="color: #98989d; text-align: center; padding: 40px 0;">正在获取最新统计数据...</div>
-      <div id="stats-error" style="display: none; color: #ff453a; text-align: center; padding: 40px 0; background: rgba(255,69,58,0.08); border-radius: 12px; margin-top: 20px;"></div>
-      <div id="stats-content" style="display: none;">
-        <div class="stats-container" style="display: flex; justify-content: space-between; margin-bottom: 24px; gap: 16px;">
-          <div class="stat-card">
-            <h3>总播放次数</h3>
-            <div id="total-playing" class="stat-value">0</div>
-          </div>
-          <div class="stat-card">
-            <h3>总获取链接次数</h3>
-            <div id="total-playback-info" class="stat-value">0</div>
-          </div>
-        </div>
-        <p style="color: #98989d; font-size: 14px; margin-bottom: 24px;">💡 以上为最近 30 天的累计数据。</p>
-        
-        <h3 style="color: #0a84ff; font-size: 18px; margin-bottom: 12px;">每日详细统计</h3>
-        <p style="color: #98989d; font-size: 14px;">💡 仅显示最近 10 天的数据记录。</p>
-        <div id="daily-stats"></div>
-        
-        <div class="footer-text" style="margin-top: 30px; display: flex; justify-content: space-between; align-items: center; border-top: none; padding-top: 0;">
-          <span style="background: rgba(255,255,255,0.05); padding: 6px 12px; border-radius: 8px;">数据更新时间: <strong id="last-updated" style="color: #f5f5f7;">--</strong></span>
-          <span>每小时自动刷新</span>
-        </div>
-      </div>
-    </div>
-    <div class="footer-text" style="margin-top: 10px; border-top: none;">
-      <p>© 2026 Emby 反向代理服务 | 仅用于学习和研究目的</p>
-      <p>交流反馈: <a href="https://t.me/Dirige_Proxy" target="_blank" style="color: #0a84ff; text-decoration: none; font-weight: 500;">https://t.me/Dirige_Proxy</a></p>
-    </div>
-  </div>
-  <script>
-    var currentDomain = window.location.hostname;
-    if (currentDomain && currentDomain !== 'localhost' && !currentDomain.includes('your-domain')) {
-      document.getElementById('example-format-1').textContent = 'https://' + currentDomain + '/你的域名:端口';
-      document.getElementById('example-format-2').textContent = 'https://' + currentDomain + '/http://你的域名:端口';
-      document.getElementById('example-format-3').textContent = 'https://' + currentDomain + '/https://你的域名:端口';
-    }
-
-    async function fetchStats() {
-      try {
-        const response = await fetch('/stats');
-        const data = await response.json();
-        if (data.error) {
-          document.getElementById('stats-loading').style.display = 'none';
-          document.getElementById('stats-error').style.display = 'block';
-          document.getElementById('stats-content').style.display = 'none';
-          document.getElementById('stats-error').textContent = data.error;
-          return;
-        }
-        document.getElementById('total-playing').textContent = data.data.total.playing;
-        document.getElementById('total-playback-info').textContent = data.data.total.playbackInfo;
-        document.getElementById('last-updated').textContent = data.data.lastUpdated;
-        const dailyStatsContainer = document.getElementById('daily-stats');
-        if (data.data.dailyStats.length > 0) {
-          var tableHTML = '<table class="stats-table"><thead><tr><th>日期</th><th>播放次数</th><th>获取链接次数</th></tr></thead><tbody>';
-          const recentStats = data.data.dailyStats.slice(0, 10);
-          recentStats.forEach(function(stat) {
-            tableHTML += '<tr><td>' + stat.date + '</td><td>' + stat.playing_count + '</td><td>' + stat.playback_info_count + '</td></tr>';
-          });
-          tableHTML += '</tbody></table>';
-          dailyStatsContainer.innerHTML = tableHTML;
-        } else {
-          dailyStatsContainer.innerHTML = '<div style="padding: 30px; text-align: center; color: #98989d;">暂无统计数据</div>';
-        }
-        document.getElementById('stats-loading').style.display = 'none';
-        document.getElementById('stats-error').style.display = 'none';
-        document.getElementById('stats-content').style.display = 'block';
-      } catch (error) {
-        console.error('获取统计数据失败:', error);
-        document.getElementById('stats-loading').style.display = 'none';
-        document.getElementById('stats-error').style.display = 'block';
-        document.getElementById('stats-content').style.display = 'none';
-        document.getElementById('stats-error').textContent = '获取统计数据失败，请稍后再试';
-      }
-    }
-    fetchStats();
-    setInterval(fetchStats, 3600000);
-  </script>
-</body>
-</html>
-`;
-
-// ===== 新增：管理后台登录页 =====
-const ADMIN_LOGIN_HTML = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>系统授权</title>
-  <style>
-    :root { --primary: #0a84ff; --bg: #000000; --card: #1c1c1e; --text: #f5f5f7; --text-sec: #98989d; --border: #38383a; }
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: var(--bg); color: var(--text); }
-    .login-box { background: var(--card); padding: 40px 30px; border-radius: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); text-align: center; width: 100%; max-width: 360px; border: 1px solid var(--border); }
-    .login-box h2 { margin: 0 0 24px 0; font-size: 22px; font-weight: 600; color: var(--primary); }
-    .login-box input { width: 100%; padding: 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 12px; font-size: 15px; outline: none; background: var(--bg); color: var(--text); }
-    .login-box input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(10,132,255,0.15); }
-    .login-box button { width: 100%; padding: 16px; background: var(--primary); color: white; border: none; border-radius: 12px; cursor: pointer; font-weight: 600; font-size: 16px; }
-    .login-box button:hover { background: #0071e3; }
-    #toast { position: fixed; top: -60px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: white; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 500; transition: top 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; }
-    #toast.show { top: 20px; }
-  </style>
-</head>
-<body>
-  <div id="toast"></div>
-  <div class="login-box">
-    <h2>安全中心</h2>
-    <input type="password" id="tokenInput" placeholder="请输入管理密码" onkeydown="if(event.key==='Enter')login()">
-    <button onclick="login()">验 证 登 录</button>
-  </div>
-  <script>
-    function showToast(msg) {
-      var t = document.getElementById('toast');
-      t.textContent = msg;
-      t.classList.add('show');
-      setTimeout(function() { t.classList.remove('show'); }, 2000);
-    }
-    function login() {
-      var token = document.getElementById('tokenInput').value.trim();
-      if (!token) return showToast('请输入密码');
-      document.cookie = 'admin_token=' + encodeURIComponent(token) + '; path=/; max-age=2592000';
-      window.location.reload();
-    }
-  </script>
-</body>
-</html>
-`;
-
-// ===== 新增：管理后台仪表盘页 =====
-const ADMIN_DASHBOARD_HTML = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>别名快捷入口管理</title>
-  <style>
-    :root { --primary: #0a84ff; --primary-hover: #0071e3; --bg: #000000; --card: #1c1c1e; --text: #f5f5f7; --text-sec: #98989d; --border: #38383a; --radius: 14px; }
-    * { box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
-    .container { max-width: 1200px; margin: 0 auto; }
-    .top-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; padding: 20px 24px; background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); }
-    .top-bar h1 { margin: 0; font-size: 20px; color: var(--primary); }
-    .btn { padding: 10px 18px; border: none; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 14px; transition: 0.2s; }
-    .btn-primary { background: var(--primary); color: white; }
-    .btn-primary:hover { background: var(--primary-hover); }
-    .btn-danger { background: #ff453a; color: white; }
-    .btn-danger:hover { background: #d63029; }
-    .btn-success { background: #30d158; color: white; }
-    .btn-success:hover { background: #28a745; }
-    .btn-warning { background: #ff9f0a; color: white; }
-    .btn-warning:hover { background: #d68600; }
-    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-sec); }
-    .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
-    .btn-sm { padding: 6px 12px; font-size: 12px; }
-    .node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 20px; }
-    .emby-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; display: flex; flex-direction: column; gap: 14px; }
-    .card-header { display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
-    .card-title-group { display: flex; align-items: center; gap: 12px; }
-    .card-icon { font-size: 28px; background: rgba(10,132,255,0.08); border-radius: 10px; padding: 6px; border: 1px solid var(--border); width: 42px; height: 42px; flex-shrink: 0; text-align: center; }
-    .card-title { font-weight: 700; font-size: 16px; color: var(--text); }
-    .card-subtitle { font-size: 13px; color: var(--text-sec); margin-top: 2px; }
-    .card-remark { font-size: 12px; color: var(--text-sec); margin-top: 4px; font-style: italic; }
-    .info-row { display: flex; align-items: flex-start; justify-content: space-between; font-size: 13px; }
-    .info-label { color: var(--text-sec); font-weight: 500; min-width: 65px; margin-top: 4px; }
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; display: inline-block; vertical-align: middle; }
-    .dot-green { background: #30d158; box-shadow: 0 0 6px rgba(48,209,88,0.4); }
-    .dot-red { background: #ff453a; box-shadow: 0 0 6px rgba(255,69,58,0.4); }
-    .dot-yellow { background: #ff9f0a; box-shadow: 0 0 6px rgba(255,159,10,0.4); }
-    .line-item { display: flex; align-items: center; padding: 10px 14px; border-radius: 10px; background: rgba(255,255,255,0.03); gap: 10px; flex-wrap: wrap; border: 1px solid var(--border); }
-    .line-origin { color: #64d2ff; font-family: monospace; font-size: 0.88em; word-break: break-all; }
-    .line-badge { padding: 3px 10px; border-radius: 6px; font-size: 0.78em; font-weight: 500; white-space: nowrap; }
-    .badge-weight { background: rgba(10,132,255,0.15); color: #64d2ff; }
-    .badge-latency { background: rgba(48,209,88,0.15); color: #30d158; }
-    .badge-fail { background: rgba(255,69,58,0.15); color: #ff453a; }
-    .badge-disabled { background: rgba(142,142,147,0.15); color: #8e8e93; }
-    .badge-dns { background: rgba(255,159,10,0.15); color: #ff9f0a; }
-    .card-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: auto; padding-top: 12px; border-top: 1px dashed var(--border); flex-wrap: wrap; }
-    .no-data { text-align: center; color: var(--text-sec); padding: 60px 20px; grid-column: 1 / -1; }
-    .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; justify-content: center; align-items: center; backdrop-filter: blur(4px); }
-    .modal-overlay.active { display: flex; }
-    .modal-box { background: var(--card); border-radius: 20px; padding: 32px; width: 440px; max-width: 90vw; box-shadow: 0 20px 60px rgba(0,0,0,0.4); border: 1px solid var(--border); }
-    .modal-box h3 { margin: 0 0 20px 0; color: var(--primary); }
-    .form-group { margin-bottom: 16px; }
-    .form-group label { display: block; color: var(--text-sec); margin-bottom: 6px; font-size: 0.88em; font-weight: 500; }
-    .form-group input { width: 100%; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; font-size: 15px; outline: none; background: var(--bg); color: var(--text); }
-    .form-group input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(10,132,255,0.15); }
-    .modal-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 24px; }
-    #toast { position: fixed; top: -60px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.85); color: white; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 500; transition: top 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; }
-    #toast.show { top: 20px; }
-    @media (max-width: 600px) {
-      body { padding: 10px; }
-      .node-grid { grid-template-columns: 1fr; }
-      .line-item { flex-direction: column; align-items: flex-start; }
-    }
-  </style>
-</head>
-<body>
-  <div id="toast"></div>
-  <div class="container">
-    <div class="top-bar">
-      <h1>别名快捷入口管理</h1>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn btn-primary" onclick="showAddNodeModal()">+ 新增别名组</button>
-        <button class="btn btn-outline" onclick="doLogout()">退出登录</button>
-      </div>
-    </div>
-    <div id="nodes-list" class="node-grid"></div>
-  </div>
-  <div id="modal-overlay" class="modal-overlay">
-    <div class="modal-box">
-      <h3 id="modal-title"></h3>
-      <div id="modal-body"></div>
-      <div class="modal-actions">
-        <button class="btn btn-outline" onclick="closeModal()">取消</button>
-        <button class="btn btn-primary" id="modal-confirm" onclick="modalConfirm()">确认</button>
-      </div>
-    </div>
-  </div>
-  <script>
-    var modalCallback = null;
-    var currentNodes = null;
-    var config = { baseDomain: 'example.com' };
-    function showToast(msg) {
-      var t = document.getElementById('toast');
-      t.textContent = msg;
-      t.classList.add('show');
-      setTimeout(function() { t.classList.remove('show'); }, 2500);
-    }
-    function apiCall(method, path, body) {
-      var opts = { method: method, headers: { 'Content-Type': 'application/json' } };
-      if (body) opts.body = JSON.stringify(body);
-      return fetch('/admin/api' + path, opts).then(function(res) { return res.json(); });
-    }
-    function doLogout() {
-      document.cookie = 'admin_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-      window.location.href = '/admin';
-    }
-    function loadConfig() {
-      apiCall('GET', '/config').then(function(r) {
-        if (r.success && r.data) {
-          config.baseDomain = r.data.baseDomain || 'example.com';
-        }
-        loadNodes();
-      }).catch(function(e) { loadNodes(); });
-    }
-    function loadNodes() {
-      apiCall('GET', '/nodes').then(function(r) {
-        if (r.success) { currentNodes = r.data; renderNodes(r.data); }
-        else showToast(r.error || '加载失败');
-      }).catch(function(e) { showToast('网络错误'); });
-    }
-    function escapeHtml(str) {
-      var div = document.createElement('div');
-      div.textContent = str;
-      return div.innerHTML;
-    }
-    function renderNodes(nodes) {
-      var c = document.getElementById('nodes-list');
-      if (!nodes || nodes.length === 0) {
-        c.innerHTML = '<div class="no-data">暂无别名组，点击上方按钮新增</div>';
-        return;
-      }
-      var html = '';
-      for (var i = 0; i < nodes.length; i++) {
-        var node = nodes[i];
-        var kw = node.keyword || '';
-        var rm = node.remark || '';
-        html += '<div class="emby-card" data-node-index="' + i + '">';
-        html += '<div class="card-header">';
-        html += '<div class="card-title-group">';
-        html += '<div class="card-icon">🎬</div>';
-        html += '<div>';
-        html += '<div class="card-title">/' + escapeHtml(kw) + '</div>';
-        html += '<div class="card-subtitle">proxy.' + config.baseDomain + '/' + escapeHtml(kw) + '</div>';
-        if (rm) html += '<div class="card-remark">' + escapeHtml(rm) + '</div>';
-        html += '</div></div>';
-        html += '<div style="display:flex;gap:6px;flex-wrap:wrap;">';
-        html += '<button class="btn btn-outline btn-sm action-edit">编辑</button>';
-        html += '<button class="btn btn-danger btn-sm action-delete">删除</button>';
-        html += '</div></div>';
-        html += '<div class="info-row"><span class="info-label">子域名:</span><span class="badge-dns line-badge">' + escapeHtml(kw) + '.' + config.baseDomain + '</span></div>';
-        html += '<div style="display:flex;flex-direction:column;gap:8px;">';
-        if (node.lines && node.lines.length > 0) {
-          for (var j = 0; j < node.lines.length; j++) {
-            var line = node.lines[j];
-            var dotCls = (line.healthy && line.enabled) ? 'dot-green' : (line.enabled ? 'dot-red' : 'dot-yellow');
-            html += '<div class="line-item" data-line-index="' + j + '">';
-            html += '<span class="status-dot ' + dotCls + '"></span>';
-            html += '<span class="line-origin">' + escapeHtml(line.origin) + '</span>';
-            html += '<span class="line-badge badge-weight">权重 ' + line.weight + '</span>';
-            // 只要有延迟值就显示（包括0，表示检测完成但可能超时或失败）
-            html += '<span class="line-badge badge-latency">' + (line.latency || 0) + 'ms</span>';
-            if (line.fail_count > 0) html += '<span class="line-badge badge-fail">失败 ' + line.fail_count + '</span>';
-            if (!line.enabled) html += '<span class="line-badge badge-disabled">已禁用</span>';
-            if (!line.healthy && line.enabled) html += '<span class="line-badge badge-fail">不健康</span>';
-            html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-left:auto;">';
-            html += '<button class="btn btn-success btn-sm action-check">检测</button>';
-            html += '<button class="btn btn-warning btn-sm action-toggle">' + (line.enabled ? '禁用' : '启用') + '</button>';
-            html += '<button class="btn btn-danger btn-sm action-line-delete">删除</button>';
-            html += '</div></div>';
-          }
-        } else {
-          html += '<div style="text-align:center;color:var(--text-sec);padding:12px;font-size:13px;">暂无线路</div>';
-        }
-        html += '</div>';
-        html += '<div class="card-footer">';
-        html += '<button class="btn btn-primary btn-sm action-add-line">+ 添加线路</button>';
-        html += '</div></div>';
-      }
-      c.innerHTML = html;
-      c.querySelectorAll('.emby-card').forEach(function(card, idx) {
-        var node = nodes[idx];
-        card.querySelector('.action-edit').onclick = function() { showEditNodeModal(node.id, node.keyword, node.remark); };
-        card.querySelector('.action-delete').onclick = function() {
-          if (!confirm('确定删除此别名组及其所有线路？')) return;
-          apiCall('DELETE', '/nodes/' + node.id).then(function(r) {
-            if (r.success) { loadNodes(); showToast('已删除'); }
-            else showToast(r.error || '删除失败');
-          });
-        };
-        card.querySelector('.action-add-line').onclick = function() { showAddLineModal(node.id, node.keyword); };
-        card.querySelectorAll('.line-item').forEach(function(lineEl, lj) {
-          var line = node.lines[lj];
-          lineEl.querySelector('.action-check').onclick = function() {
-            showToast('检测中...');
-            apiCall('POST', '/lines/' + line.id + '/check').then(function(r) {
-              if (r.success) { loadNodes(); showToast(r.data.healthy ? '线路健康, 延迟 ' + r.data.latency + 'ms' : '线路不健康'); }
-              else showToast(r.error || '检测失败');
-            });
-          };
-          lineEl.querySelector('.action-toggle').onclick = function() {
-            apiCall('PUT', '/lines/' + line.id, { enabled: line.enabled ? 0 : 1 }).then(function(r) { if (r.success) loadNodes(); else showToast(r.error || '操作失败'); });
-          };
-          lineEl.querySelector('.action-line-delete').onclick = function() {
-            if (!confirm('确定删除此线路？')) return;
-            apiCall('DELETE', '/lines/' + line.id).then(function(r) { if (r.success) { loadNodes(); showToast('已删除'); } else showToast(r.error || '删除失败'); });
-          };
-        });
-      });
-    }
-    function showModal(title, bodyHtml, callback) {
-      document.getElementById('modal-title').textContent = title;
-      document.getElementById('modal-body').innerHTML = bodyHtml;
-      document.getElementById('modal-overlay').classList.add('active');
-      modalCallback = callback;
-    }
-    function closeModal() {
-      document.getElementById('modal-overlay').classList.remove('active');
-      modalCallback = null;
-    }
-    function modalConfirm() {
-      if (modalCallback) modalCallback();
-    }
-    function showAddNodeModal() {
-      showModal('新增别名组',
-        '<div class="form-group"><label>关键字 (keyword)</label><input id="f-keyword" placeholder="例如: myemby"></div>' +
-        '<div class="form-group"><label>备注</label><input id="f-remark" placeholder="可选"></div>',
-        function() {
-          var keyword = document.getElementById('f-keyword').value.trim();
-          if (!keyword) { showToast('请输入关键字'); return; }
-          apiCall('POST', '/nodes', { keyword: keyword, remark: document.getElementById('f-remark').value.trim() }).then(function(r) {
-            if (r.success) { closeModal(); loadNodes(); showToast('创建成功'); }
-            else showToast(r.error || '创建失败');
-          });
-        }
-      );
-    }
-    function showEditNodeModal(nodeId, keyword, remark) {
-      showModal('编辑别名组',
-        '<div class="form-group"><label>关键字 (keyword)</label><input id="f-keyword" value="' + escapeHtml(keyword || '') + '"></div>' +
-        '<div class="form-group"><label>备注</label><input id="f-remark" value="' + escapeHtml(remark || '') + '"></div>',
-        function() {
-          var newKeyword = document.getElementById('f-keyword').value.trim();
-          var newRemark = document.getElementById('f-remark').value.trim();
-          if (!newKeyword) { showToast('关键字不能为空'); return; }
-          apiCall('PUT', '/nodes/' + nodeId, { keyword: newKeyword, remark: newRemark }).then(function(r) {
-            if (r.success) { closeModal(); loadNodes(); showToast('更新成功'); }
-            else showToast(r.error || '更新失败');
-          });
-        }
-      );
-    }
-    function showAddLineModal(nodeId, keyword) {
-      showModal('新增线路 - ' + keyword,
-        '<div class="form-group"><label>线路地址 (origin)</label><input id="f-origin" placeholder="https://xxx.com"></div>' +
-        '<div class="form-group"><label>权重</label><input id="f-weight" type="number" value="1" min="1"></div>',
-        function() {
-          var origin = document.getElementById('f-origin').value.trim();
-          if (!origin) { showToast('请输入线路地址'); return; }
-          apiCall('POST', '/lines', { node_id: nodeId, origin: origin, weight: parseInt(document.getElementById('f-weight').value) || 1 }).then(function(r) {
-            if (r.success) { closeModal(); loadNodes(); showToast('添加成功'); }
-            else showToast(r.error || '添加失败');
-          });
-        }
-      );
-    }
-    loadConfig();
-  </script>
-</body>
-</html>
-`;
-
-// ===== 新增：别名系统工具函数 =====
-
-// 确保别名相关 D1 表存在
-async function ensureAliasTables(env) {
-    if (!env.DB) return false;
-    try {
-        await env.DB.prepare(`
-            CREATE TABLE IF NOT EXISTS alias_nodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                keyword TEXT,
-                remark TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `).run();
-        await env.DB.prepare(`
-            CREATE TABLE IF NOT EXISTS alias_lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id INTEGER,
-                origin TEXT,
-                weight INTEGER DEFAULT 1,
-                enabled INTEGER DEFAULT 1,
-                healthy INTEGER DEFAULT 1,
-                latency INTEGER DEFAULT 0,
-                fail_count INTEGER DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `).run();
-        return true;
-    } catch (e) {
-        console.error('创建别名表失败:', e);
-        return false;
-    }
-}
-
-// 查询别名：根据 pathname 的第一段判断是否为别名关键字
-async function lookupAlias(pathname, env) {
-    if (!env.DB) return null;
-
-    // 提取第一段路径
-    var segments = pathname.substring(1).split('/');
-    var keyword = segments[0];
-    if (!keyword) return null;
-
-    // 如果包含点号或以 http 开头，说明是域名/URL格式，不是别名
-    if (keyword.includes('.') || keyword.toLowerCase().startsWith('http')) return null;
-
-    try {
-        // 查询别名节点
-        var node = await env.DB.prepare(
-            'SELECT id, keyword FROM alias_nodes WHERE keyword = ? LIMIT 1'
-        ).bind(keyword).first();
-        if (!node) return null;
-
-        // 查询该节点下所有启用的线路
-        var linesResult = await env.DB.prepare(
-            'SELECT * FROM alias_lines WHERE node_id = ? AND enabled = 1'
-        ).bind(node.id).all();
-        if (!linesResult.results || linesResult.results.length === 0) return null;
-
-        // 拼接剩余路径
-        var remainingPath = segments.slice(1).join('/');
-
-        return {
-            keyword: node.keyword,
-            nodeId: node.id,
-            lines: linesResult.results,
-            remainingPath: remainingPath
-        };
-    } catch (e) {
-        console.error('别名查询失败:', e);
-        return null;
-    }
-}
-
-// 加权随机选择线路
-function selectLine(lines) {
-    // 优先选择 healthy=1 且 enabled=1 的线路
-    var healthyLines = lines.filter(function(l) { return l.healthy === 1 && l.enabled === 1; });
-    if (healthyLines.length > 0) return weightedRandom(healthyLines);
-
-    // 退而求其次：所有 enabled=1 的线路（即使 unhealthy）
-    var enabledLines = lines.filter(function(l) { return l.enabled === 1; });
-    if (enabledLines.length > 0) return weightedRandom(enabledLines);
-
-    return null;
-}
-
-// 加权随机算法
-function weightedRandom(lines) {
-    var totalWeight = 0;
-    for (var i = 0; i < lines.length; i++) totalWeight += lines[i].weight;
-    var random = Math.random() * totalWeight;
-    for (var i = 0; i < lines.length; i++) {
-        random -= lines[i].weight;
-        if (random <= 0) return lines[i];
-    }
-    return lines[lines.length - 1];
-}
-
-// 标记线路为不健康
-async function markUnhealthy(env, lineId) {
-    if (!env.DB) return;
-    try {
-        await env.DB.prepare(
-            'UPDATE alias_lines SET healthy = 0, fail_count = fail_count + 1 WHERE id = ?'
-        ).bind(lineId).run();
-    } catch (e) {
-        console.error('标记线路不健康失败:', e);
-    }
-}
-
-// 标记线路为健康并更新延迟
-async function markHealthy(env, lineId, latency) {
-    if (!env.DB) return;
-    try {
-        await env.DB.prepare(
-            'UPDATE alias_lines SET healthy = 1, latency = ?, fail_count = 0 WHERE id = ?'
-        ).bind(latency, lineId).run();
-    } catch (e) {
-        console.error('标记线路健康失败:', e);
-    }
-}
-
-// 从请求中读取 admin_token Cookie
-function getAdminCookie(request) {
-    var cookieString = request.headers.get('Cookie');
-    if (!cookieString) return null;
-    var match = cookieString.match(/(^| )admin_token=([^;]+)/);
-    if (match) return decodeURIComponent(match[2]);
-    return null;
-}
-
-// 验证管理员身份
-function verifyAdmin(request, env) {
-    var token = getAdminCookie(request);
-    return token === env.ADMIN_PASSWORD;
-}
-
-// ===== 新增：管理后台处理 =====
-async function handleAdmin(request, env, workerUrl, ctx) {
-    var pathname = workerUrl.pathname;
-
-    // 管理后台页面
-    if (pathname === '/admin' || pathname === '/admin/') {
-        if (verifyAdmin(request, env)) {
-            return new Response(ADMIN_DASHBOARD_HTML, {
-                headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
-            });
-        } else {
-            return new Response(ADMIN_LOGIN_HTML, {
-                headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
-            });
-        }
-    }
-
-    // API 路由
-    if (pathname.startsWith('/admin/api/')) {
-        return handleAdminAPI(request, env, pathname, ctx);
-    }
-
-    return new Response('Not Found', { status: 404 });
-}
-
-// 管理后台 API 处理
-async function handleAdminAPI(request, env, pathname, ctx) {
-    // CORS 预检
-    if (request.method === 'OPTIONS') {
-        return new Response(null, PREFLIGHT_INIT);
-    }
-
-    // API 接口需要认证
-    if (!verifyAdmin(request, env)) {
-        return new Response(JSON.stringify({ success: false, error: '未登录或密码错误' }), {
-            status: 401,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-
-    // 确保 D1 表存在
-    await ensureAliasTables(env);
-    if (!env.DB) {
-        return new Response(JSON.stringify({ success: false, error: 'D1 数据库未绑定' }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-
-    // 路由分发
-    if (pathname === '/admin/api/nodes' && request.method === 'GET') {
-        return handleAdminGetNodes(env);
-    }
-    if (pathname === '/admin/api/nodes' && request.method === 'POST') {
-        return handleAdminCreateNode(request, env, ctx);
-    }
-    if (pathname.match(/^\/admin\/api\/nodes\/\d+$/) && request.method === 'PUT') {
-        var nodeId = parseInt(pathname.split('/').pop());
-        return handleAdminUpdateNode(request, env, nodeId, ctx);
-    }
-    if (pathname.match(/^\/admin\/api\/nodes\/\d+$/) && request.method === 'DELETE') {
-        var nodeId = parseInt(pathname.split('/').pop());
-        return handleAdminDeleteNode(env, nodeId, ctx);
-    }
-    if (pathname === '/admin/api/lines' && request.method === 'POST') {
-        return handleAdminCreateLine(request, env);
-    }
-    if (pathname.match(/^\/admin\/api\/lines\/\d+$/) && request.method === 'PUT') {
-        var lineId = parseInt(pathname.split('/').pop());
-        return handleAdminUpdateLine(request, env, lineId);
-    }
-    if (pathname.match(/^\/admin\/api\/lines\/\d+$/) && request.method === 'DELETE') {
-        var lineId = parseInt(pathname.split('/').pop());
-        return handleAdminDeleteLine(env, lineId);
-    }
-    if (pathname.match(/^\/admin\/api\/lines\/\d+\/check$/) && request.method === 'POST') {
-        var lineId = parseInt(pathname.split('/').filter(Boolean).pop());
-        return handleAdminCheckLine(env, lineId);
-    }
-    
-    // DNS日志查看接口
-    if (pathname === '/admin/api/dns/logs' && request.method === 'GET') {
-        return new Response(JSON.stringify({ success: true, data: dnsLogs }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-
-    // 配置信息接口（供前端获取域名等配置）
-    if (pathname === '/admin/api/config' && request.method === 'GET') {
-        return new Response(JSON.stringify({
-            success: true,
-            data: {
-                baseDomain: env.BASE_DOMAIN || 'example.com'
-            }
-        }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-
-    return new Response(JSON.stringify({ success: false, error: '未知接口' }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-    });
-}
-
-// 获取所有别名节点及线路
-async function handleAdminGetNodes(env) {
-    try {
-        var nodesResult = await env.DB.prepare('SELECT * FROM alias_nodes ORDER BY id DESC').all();
-        var nodes = nodesResult.results || [];
-
-        // 批量查询所有线路
-        var linesResult = await env.DB.prepare('SELECT * FROM alias_lines ORDER BY weight DESC').all();
-        var allLines = linesResult.results || [];
-
-        // 按节点分组
-        var linesByNode = {};
-        allLines.forEach(function(line) {
-            if (!linesByNode[line.node_id]) linesByNode[line.node_id] = [];
-            linesByNode[line.node_id].push(line);
-        });
-
-        nodes.forEach(function(node) {
-            node.lines = linesByNode[node.id] || [];
-        });
-
-        return new Response(JSON.stringify({ success: true, data: nodes }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '查询失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 创建别名节点
-async function handleAdminCreateNode(request, env, ctx) {
-    try {
-        var body = await request.json();
-        var keyword = (body.keyword || '').trim();
-        var remark = (body.remark || '').trim();
-        if (!keyword) {
-            return new Response(JSON.stringify({ success: false, error: '关键字不能为空' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-        // 检查关键字是否已存在
-        var existing = await env.DB.prepare('SELECT id FROM alias_nodes WHERE keyword = ?').bind(keyword).first();
-        if (existing) {
-            return new Response(JSON.stringify({ success: false, error: '关键字已存在' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-        await env.DB.prepare('INSERT INTO alias_nodes (keyword, remark) VALUES (?, ?)').bind(keyword, remark).run();
-        // 自动创建 DNS CNAME 记录
-        ctx.waitUntil(createDnsRecord(keyword, env));
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '创建失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 更新别名节点（关键字和备注）
-async function handleAdminUpdateNode(request, env, nodeId, ctx) {
-    try {
-        var body = await request.json();
-        var sets = [];
-        var params = [];
-        var oldKeyword = null;
-        if (body.keyword !== undefined) {
-            var newKeyword = body.keyword.trim();
-            if (!newKeyword) {
-                return new Response(JSON.stringify({ success: false, error: '关键字不能为空' }), {
-                    status: 400,
-                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-            // 检查新关键字是否已被其他节点使用
-            var existing = await env.DB.prepare('SELECT id FROM alias_nodes WHERE keyword = ? AND id != ?').bind(newKeyword, nodeId).first();
-            if (existing) {
-                return new Response(JSON.stringify({ success: false, error: '关键字已存在' }), {
-                    status: 400,
-                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-            // 获取旧关键字用于DNS更新
-            var oldNode = await env.DB.prepare('SELECT keyword FROM alias_nodes WHERE id = ?').bind(nodeId).first();
-            oldKeyword = oldNode ? oldNode.keyword : null;
-            sets.push('keyword = ?');
-            params.push(newKeyword);
-        }
-        if (body.remark !== undefined) { sets.push('remark = ?'); params.push(body.remark.trim()); }
-        if (sets.length === 0) {
-            return new Response(JSON.stringify({ success: false, error: '无更新字段' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-        params.push(nodeId);
-        await env.DB.prepare('UPDATE alias_nodes SET ' + sets.join(', ') + ' WHERE id = ?').bind(...params).run();
-        // 如果关键字变更，更新DNS记录
-        if (oldKeyword && body.keyword && oldKeyword !== body.keyword.trim()) {
-            ctx.waitUntil(deleteDnsRecord(oldKeyword, env));
-            ctx.waitUntil(createDnsRecord(body.keyword.trim(), env));
-        }
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '更新失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 创建 DNS CNAME 记录（子域名自动映射）
-async function createDnsRecord(keyword, env) {
-    var apiToken = env.CF_API_TOKEN;
-    var zoneId = env.CF_ZONE_ID;
-    var baseDomain = env.BASE_DOMAIN;
-
-    addDnsLog('INFO', '开始创建DNS记录', { keyword: keyword, hasToken: !!apiToken, hasZoneId: !!zoneId, baseDomain: baseDomain });
-
-    if (!apiToken) {
-        addDnsLog('ERROR', 'CF_API_TOKEN 未配置', null);
-        return { success: false, error: 'CF_API_TOKEN 未配置' };
-    }
-    if (!zoneId) {
-        addDnsLog('ERROR', 'CF_ZONE_ID 未配置', null);
-        return { success: false, error: 'CF_ZONE_ID 未配置' };
-    }
-    
-    try {
-        var fullName = keyword + '.' + baseDomain;
-        addDnsLog('INFO', '检查DNS记录是否已存在', { name: fullName });
-        
-        // 先检查是否已存在
-        var checkRes = await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records?name=' + encodeURIComponent(fullName), {
-            headers: { 'Authorization': 'Bearer ' + apiToken, 'Content-Type': 'application/json' }
-        });
-        
-        addDnsLog('INFO', '检查请求响应', { status: checkRes.status });
-        
-        var checkData = await checkRes.json();
-        if (!checkData.success) {
-            addDnsLog('ERROR', '检查记录失败', { error: checkData.errors });
-            return { success: false, error: '检查记录失败: ' + JSON.stringify(checkData.errors) };
-        }
-        
-        if (checkData.result && checkData.result.length > 0) {
-            addDnsLog('INFO', 'DNS记录已存在，跳过创建', { record: checkData.result[0] });
-            return { success: true, message: '记录已存在' };
-        }
-        
-        // 创建 CNAME 记录
-        addDnsLog('INFO', '开始创建CNAME记录', { name: keyword, content: 'proxy.' + baseDomain });
-        
-        var createRes = await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records', {
-            method: 'POST',
-            headers: { 'Authorization': 'Bearer ' + apiToken, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                type: 'CNAME',
-                name: keyword,
-                content: 'proxy.' + baseDomain,
-                proxied: true
-            })
-        });
-        
-        addDnsLog('INFO', '创建请求响应', { status: createRes.status });
-        
-        var createData = await createRes.json();
-        if (!createData.success) {
-            addDnsLog('ERROR', '创建记录失败', { error: createData.errors });
-            return { success: false, error: '创建失败: ' + JSON.stringify(createData.errors) };
-        }
-        
-        addDnsLog('SUCCESS', 'DNS记录创建成功', { record: createData.result });
-        return { success: true, message: 'DNS记录创建成功' };
-        
-    } catch (e) {
-        addDnsLog('ERROR', '创建过程异常', { error: e.message, stack: e.stack });
-        return { success: false, error: '创建过程异常: ' + e.message };
-    }
-}
-
-// 删除 DNS CNAME 记录
-async function deleteDnsRecord(keyword, env) {
-    var apiToken = env.CF_API_TOKEN;
-    var zoneId = env.CF_ZONE_ID;
-    var baseDomain = env.BASE_DOMAIN;
-    if (!apiToken || !zoneId) return;
-    try {
-        var checkRes = await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records?name=' + encodeURIComponent(keyword + '.' + baseDomain), {
-            headers: { 'Authorization': 'Bearer ' + apiToken, 'Content-Type': 'application/json' }
-        });
-        var checkData = await checkRes.json();
-        if (checkData.success && checkData.result) {
-            for (var i = 0; i < checkData.result.length; i++) {
-                var record = checkData.result[i];
-                if (record.type === 'CNAME') {
-                    await fetch('https://api.cloudflare.com/client/v4/zones/' + zoneId + '/dns_records/' + record.id, {
-                        method: 'DELETE',
-                        headers: { 'Authorization': 'Bearer ' + apiToken }
-                    });
-                }
-            }
-        }
-    } catch (e) {
-        console.error('DNS记录删除失败:', e);
-    }
-}
-
-// 删除别名节点（同时删除关联线路和DNS记录）
-async function handleAdminDeleteNode(env, nodeId, ctx) {
-    try {
-        // 获取关键字用于删除DNS
-        var node = await env.DB.prepare('SELECT keyword FROM alias_nodes WHERE id = ?').bind(nodeId).first();
-        if (node && node.keyword) ctx.waitUntil(deleteDnsRecord(node.keyword, env));
-        await env.DB.prepare('DELETE FROM alias_lines WHERE node_id = ?').bind(nodeId).run();
-        await env.DB.prepare('DELETE FROM alias_nodes WHERE id = ?').bind(nodeId).run();
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '删除失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 创建线路
-async function handleAdminCreateLine(request, env) {
-    try {
-        var body = await request.json();
-        var nodeId = body.node_id;
-        var origin = (body.origin || '').trim();
-        var weight = parseInt(body.weight) || 1;
-        if (!nodeId || !origin) {
-            return new Response(JSON.stringify({ success: false, error: '参数不完整' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-        await env.DB.prepare('INSERT INTO alias_lines (node_id, origin, weight) VALUES (?, ?, ?)').bind(nodeId, origin, weight).run();
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '创建失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 更新线路
-async function handleAdminUpdateLine(request, env, lineId) {
-    try {
-        var body = await request.json();
-        var sets = [];
-        var params = [];
-        if (body.origin !== undefined) { sets.push('origin = ?'); params.push(body.origin.trim()); }
-        if (body.weight !== undefined) { sets.push('weight = ?'); params.push(parseInt(body.weight) || 1); }
-        if (body.enabled !== undefined) { sets.push('enabled = ?'); params.push(body.enabled ? 1 : 0); }
-        if (body.healthy !== undefined) { sets.push('healthy = ?'); params.push(body.healthy ? 1 : 0); }
-        if (sets.length === 0) {
-            return new Response(JSON.stringify({ success: false, error: '无更新字段' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-        params.push(lineId);
-        await env.DB.prepare('UPDATE alias_lines SET ' + sets.join(', ') + ' WHERE id = ?').bind(...params).run();
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '更新失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 删除线路
-async function handleAdminDeleteLine(env, lineId) {
-    try {
-        await env.DB.prepare('DELETE FROM alias_lines WHERE id = ?').bind(lineId).run();
-        return new Response(JSON.stringify({ success: true }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '删除失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// 手动健康检测线路
-async function handleAdminCheckLine(env, lineId) {
-    try {
-        var line = await env.DB.prepare('SELECT * FROM alias_lines WHERE id = ?').bind(lineId).first();
-        if (!line) {
-            return new Response(JSON.stringify({ success: false, error: '线路不存在' }), {
-                status: 404,
-                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-            });
-        }
-
-        // 构建检测URL - 添加超时参数避免长时间等待
-        var checkUrl = line.origin;
-        if (!checkUrl.endsWith('/')) checkUrl += '/';
-        checkUrl += 'System/Info/Public'; // Emby 公开信息接口，不需要认证
-
-        var startTime = Date.now();
-        var latency = 0;
-        var isHealthy = false;
-        var statusCode = 0;
-        var errorMsg = '';
-
-        try {
-            // 使用 GET 方法而不是 HEAD，因为有些服务器不支持 HEAD
-            // 设置超时 10 秒
-            var controller = new AbortController();
-            var timeoutId = setTimeout(function() { controller.abort(); }, 10000);
-
-            var checkResponse = await fetch(checkUrl, {
-                method: 'GET',
-                redirect: 'follow',
-                signal: controller.signal
-            });
-
-            clearTimeout(timeoutId);
-            latency = Date.now() - startTime;
-            statusCode = checkResponse.status;
-
-            // 2xx 和 3xx 认为是健康的
-            isHealthy = checkResponse.status >= 200 && checkResponse.status < 400;
-
-            // 更新数据库
-            await env.DB.prepare('UPDATE alias_lines SET healthy = ?, latency = ?, fail_count = ? WHERE id = ?')
-                .bind(isHealthy ? 1 : 0, latency, isHealthy ? 0 : line.fail_count + 1, lineId).run();
-
-        } catch (fetchErr) {
-            latency = Date.now() - startTime;
-            isHealthy = false;
-            errorMsg = fetchErr.name === 'AbortError' ? '请求超时' : fetchErr.message;
-
-            // 更新数据库 - 即使失败也记录延迟
-            await env.DB.prepare('UPDATE alias_lines SET healthy = 0, latency = ?, fail_count = fail_count + 1 WHERE id = ?')
-                .bind(latency, lineId).run();
-        }
-
-        return new Response(JSON.stringify({
-            success: true,
-            data: {
-                healthy: isHealthy,
-                latency: latency,
-                status: statusCode,
-                error: errorMsg || undefined
-            }
-        }), {
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-
-    } catch (e) {
-        return new Response(JSON.stringify({ success: false, error: '检测失败: ' + e.message }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
-    }
-}
-
-// ===== 新增：别名代理处理（带 failover） =====
-// 核心思路：别名系统只做 URL Rewrite，然后调用原始代理逻辑
-async function handleAliasProxy(originalRequest, env, ctx, aliasResult) {
-    var keyword = aliasResult.keyword;
-    var lines = aliasResult.lines;
-    var remainingPath = aliasResult.remainingPath;
-    var maxRetries = Math.min(lines.length, ALIAS_MAX_RETRIES);
-    var triedLineIds = {};
-
-    // 缓存请求体（用于重试时重建请求）
-    var bodyCache = null;
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].indexOf(originalRequest.method) >= 0) {
-        try {
-            bodyCache = await originalRequest.arrayBuffer();
-        } catch (e) {
-            bodyCache = null;
-        }
-    }
-
-    for (var attempt = 0; attempt < maxRetries; attempt++) {
-        // 过滤掉已尝试过的线路
-        var availableLines = lines.filter(function(l) {
-            return !triedLineIds[l.id] && l.enabled === 1;
-        });
-        if (availableLines.length === 0) break;
-
-        // 加权随机选择线路
-        var selectedLine = selectLine(availableLines);
-        if (!selectedLine) break;
-
-        triedLineIds[selectedLine.id] = true;
-
-        // URL Rewrite: /myemby/Users/xxx -> /https://emby-server.com/Users/xxx
-        var origin = selectedLine.origin.replace(/\/+$/, '');
-        var rewrittenPath = '/' + origin;
-        if (remainingPath) rewrittenPath += '/' + remainingPath;
-
-        // 构建新请求（URL 已 rewrite，底层代理逻辑会按旧格式解析）
-        var newUrl = new URL(originalRequest.url);
-        newUrl.pathname = rewrittenPath;
-
-        var newRequest = new Request(newUrl.toString(), {
-            method: originalRequest.method,
-            headers: originalRequest.headers,
-            body: bodyCache
-        });
-
-        try {
-            var startTime = Date.now();
-            var response = await executeProxy(newRequest, env, ctx);
-            var latency = Date.now() - startTime;
-
-            // 5xx 响应：标记不健康，尝试下一线路
-            if (response.status >= 500) {
-                ctx.waitUntil(markUnhealthy(env, selectedLine.id));
-                continue;
-            }
-
-            // 成功：标记健康并更新延迟
-            ctx.waitUntil(markHealthy(env, selectedLine.id, latency));
-            return response;
-        } catch (e) {
-            // fetch 异常（timeout/TLS错误/网络错误）：标记不健康，尝试下一线路
-            ctx.waitUntil(markUnhealthy(env, selectedLine.id));
-            console.error('别名代理线路 ' + selectedLine.origin + ' 失败:', e.message);
-            continue;
-        }
-    }
-
-    // 所有线路都失败
-    return new Response('All lines unavailable for alias: ' + keyword, { status: 502 });
-}
-
-// ===== 原始代理逻辑（提取为独立函数，逻辑完全未修改） =====
-// 这是从原始 fetch handler 中提取的代理核心逻辑
-// 别名系统通过 URL Rewrite 后调用此函数，底层代理行为完全一致
-async function executeProxy(request, env, ctx) {
-    const workerUrl = new URL(request.url);
-
-    // --- 解析目标 URL ---
-    let upstreamUrl;
-    try {
-        let path = workerUrl.pathname.substring(1);
-
-        if (path.startsWith('/')) {
-            return new Response('Invalid proxy format. Please use: https://your-worker-domain/your-emby-server:port', { status: 400 });
-        }
-
-        if (path === 'Sessions/Playing' || path.startsWith('Sessions/Playing/') || path === 'PlaybackInfo' || path.startsWith('PlaybackInfo/')) {
-            return new Response('Invalid proxy format. Please use: https://your-worker-domain/your-emby-server:port', { status: 400 });
-        }
-
-        path = path.replace(/^(https?)\/(?!\/)/, '$1://');
-        if (!path.startsWith('http')) {
-            path = 'https://' + path;
-        }
-        upstreamUrl = new URL(path);
-        upstreamUrl.search = workerUrl.search;
-
-        const hostname = upstreamUrl.hostname;
-        if (!hostname || hostname === 'Sessions' || hostname === 'PlaybackInfo') {
-            return new Response('Invalid proxy format. Please use: https://your-worker-domain/your-emby-server:port', { status: 400 });
-        }
-
-        if (PIKPAK_DOMAINS.some(domain => hostname.endsWith(domain))) {
-            const redirectUrl = new URL(upstreamUrl.pathname + upstreamUrl.search, CONFIG.pikpakProxyUrl);
-            return Response.redirect(redirectUrl.toString(), 301);
-        }
-
-        if (blocker.check(upstreamUrl.toString())) {
-            return Response.redirect('https://baidu.com', 301);
-        }
-    } catch (e) {
-      return new Response('Invalid URL format. Please use: https://your-worker-domain/your-emby-server:port', { status: 400 });
-    }
-
-    // --- 判断是否需要走美西 ---
-    const currentEdgeColo = request.cf?.colo;
-
-    if (currentEdgeColo && JP_COLOS.includes(currentEdgeColo)) {
-        const originalHost = upstreamUrl.host;
-        for (const domainSuffix in DOMAIN_PROXY_RULES) {
-            if (originalHost.endsWith(domainSuffix)) {
-                upstreamUrl.hostname = DOMAIN_PROXY_RULES[domainSuffix];
-                break;
-            }
-        }
-    }
-
-    // --- 统计逻辑 ---
-    if (upstreamUrl.pathname.endsWith('/Sessions/Playing')) {
-        ctx.waitUntil(recordStats(env, 'playing'));
-    } else if (upstreamUrl.pathname.includes('/PlaybackInfo')) {
-        ctx.waitUntil(recordStats(env, 'playback_info'));
-    }
-
-    // --- WebSocket ---
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
-      return fetch(upstreamUrl.toString(), request);
-    }
-
-    // --- 构造请求头和请求体 ---
-    const upstreamRequestHeaders = new Headers(request.headers);
-    upstreamRequestHeaders.set('Host', upstreamUrl.host);
-    upstreamRequestHeaders.delete('Referer');
-
-    const clientIp = request.headers.get('cf-connecting-ip');
-    if (clientIp) {
-        upstreamRequestHeaders.set('x-forwarded-for', clientIp);
-        upstreamRequestHeaders.set('x-real-ip', clientIp);
-    }
-
-    let requestBody = request.body;
-    if (["POST", "PUT", "PATCH", "DELETE"].indexOf(request.method) >= 0) {
-        const ct = (request.headers.get('content-type') || "").toLowerCase();
-        if (ct.includes('application/json')) {
-            let requestJSON = await request.json();
-            requestBody = JSON.stringify(requestJSON);
-        } else if (ct.includes('application/text') || ct.includes('text/html')) {
-            requestBody = await request.text();
-        } else if (ct.includes('form')) {
-            requestBody = await request.formData();
-        } else {
-            requestBody = await request.blob();
-        }
-    }
-
-    const upstreamRequest = new Request(upstreamUrl.toString(), {
-      method: request.method,
-      headers: upstreamRequestHeaders,
-      body: requestBody,
-      redirect: 'manual',
-    });
-
-    // --- 发起请求 ---
-    const upstreamResponse = await fetch(upstreamRequest);
-
-    // --- 处理重定向 (智能重定向优化) ---
-    const location = upstreamResponse.headers.get('Location');
-    if (location && upstreamResponse.status >= 300 && upstreamResponse.status < 400) {
-      try {
-        const redirectUrl = new URL(location, upstreamUrl);
-
-        if (redirectUrl.hostname === upstreamUrl.hostname) {
-          return fetch(redirectUrl.toString(), upstreamRequest);
-        }
-
-        if (MANUAL_REDIRECT_DOMAINS.some(domain => redirectUrl.hostname.endsWith(domain))) {
-          const responseHeaders = new Headers(upstreamResponse.headers);
-          responseHeaders.set('Location', redirectUrl.toString());
-          return new Response(upstreamResponse.body, {
-            status: upstreamResponse.status,
-            statusText: upstreamResponse.statusText,
-            headers: responseHeaders
-          });
-        }
-
-        const followHeaders = new Headers(upstreamRequestHeaders);
-        followHeaders.set('Host', redirectUrl.host);
-
-        return fetch(redirectUrl.toString(), {
-            method: request.method,
-            headers: followHeaders,
-            body: requestBody,
-            redirect: 'follow'
-        });
-
-      } catch (e) {
-        return upstreamResponse;
-      }
-    }
-
-    // --- 处理常规响应 (缓存策略优化 + 安全头增强) ---
-    const responseHeaders = new Headers(upstreamResponse.headers);
-
-    const contentType = upstreamResponse.headers.get('content-type');
-    if (contentType && CONFIG.cacheEnabled) {
-        if (contentType.includes('image/') || contentType.includes('text/css') ||
-            contentType.includes('application/javascript') || contentType.includes('font/')) {
-            responseHeaders.set('Cache-Control', 'public, max-age=86400');
-        } else if (contentType.includes('video/') || contentType.includes('audio/')) {
-            responseHeaders.set('Cache-Control', 'public, max-age=3600');
-        } else {
-            responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-        }
-    }
-
-    responseHeaders.set('Access-Control-Allow-Origin', '*');
-    responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    responseHeaders.set('Access-Control-Allow-Headers', '*');
-
-    responseHeaders.set('X-Content-Type-Options', 'nosniff');
-    responseHeaders.set('X-Frame-Options', 'DENY');
-    responseHeaders.set('X-XSS-Protection', '1; mode=block');
-    responseHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-
-    responseHeaders.delete('Content-Security-Policy');
-
-    console.log(`[${new Date().toISOString()}] ${request.method} ${upstreamUrl} - ${upstreamResponse.status} - ${request.cf?.colo}`);
-
-    return new Response(upstreamResponse.body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
-      headers: responseHeaders,
-    });
-}
-
-// ===== 原始工具函数（未修改） =====
 async function recordStats(env, type) {
-    try {
-        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
-
-        if (!env.DB) {
-            console.error("D1 数据库未绑定，变量名需为 'DB'");
-            return;
-        }
-
-        let query = "";
-        let params = [];
-
-        if (type === 'playing') {
-            query = `
-                INSERT INTO auto_emby_daily_stats (date, playing_count, playback_info_count)
-                VALUES (?, 1, 0)
-                ON CONFLICT(date) DO UPDATE SET playing_count = playing_count + 1
-            `;
-            params = [today];
-        } else if (type === 'playback_info') {
-            query = `
-                INSERT INTO auto_emby_daily_stats (date, playing_count, playback_info_count)
-                VALUES (?, 0, 1)
-                ON CONFLICT(date) DO UPDATE SET playback_info_count = playback_info_count + 1
-            `;
-            params = [today];
-        }
-
-        if (query) {
-            await env.DB.prepare(query).bind(...params).run();
-        }
-
-    } catch (e) {
-        console.error('统计写入失败:', e);
-    }
-}
-
-function createErrorResponse(message, status = 500) {
-    return new Response(JSON.stringify({ error: message }), {
-        status,
-        headers: { 'Content-Type': 'application/json' }
-    });
+  if (!env.DB || !CONFIG.enableStats) return;
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  const q = type === 'playing'
+    ? `INSERT INTO auto_emby_daily_stats (date, playing_count, playback_info_count) VALUES (?, 1, 0)
+       ON CONFLICT(date) DO UPDATE SET playing_count = playing_count + 1`
+    : `INSERT INTO auto_emby_daily_stats (date, playing_count, playback_info_count) VALUES (?, 0, 1)
+       ON CONFLICT(date) DO UPDATE SET playback_info_count = playback_info_count + 1`;
+  await env.DB.prepare(q).bind(today).run();
 }
 
 async function handleStatsRequest(env) {
-    try {
-        if (!env.DB) {
-            return new Response(JSON.stringify({
-                error: "D1 数据库未绑定，变量名需为 'DB'",
-                data: null
-            }), {
-                headers: {
-                    'Content-Type': 'application/json; charset=utf-8'
-                }
-            });
-        }
-
-         const statsQuery = `
-             SELECT date, playing_count, playback_info_count
-             FROM auto_emby_daily_stats
-             WHERE date >= date('now', '-30 days')
-             ORDER BY date DESC
-         `;
-
-         const statsResult = await env.DB.prepare(statsQuery).all();
-
-         const totalQuery = `
-             SELECT
-                 SUM(playing_count) as total_playing,
-                 SUM(playback_info_count) as total_playback_info
-             FROM auto_emby_daily_stats
-             WHERE date >= date('now', '-30 days')
-         `;
-
-         const totalResult = await env.DB.prepare(totalQuery).first();
-
-         const responseData = {
-             error: null,
-             data: {
-                 total: {
-                     playing: totalResult?.total_playing || 0,
-                     playbackInfo: totalResult?.total_playback_info || 0
-                 },
-                 dailyStats: statsResult?.results || [],
-                 lastUpdated: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
-             }
-         };
-
-         return new Response(JSON.stringify(responseData), {
-             headers: {
-                 'Content-Type': 'application/json; charset=utf-8',
-                 'Access-Control-Allow-Origin': '*'
-             }
-         });
-
-     } catch (e) {
-         console.error('统计查询失败:', e);
-         return new Response(JSON.stringify({
-             error: "统计查询失败: " + e.message,
-             data: null
-         }), {
-             status: 500,
-             headers: {
-                 'Content-Type': 'application/json; charset=utf-8'
-             }
-         });
-     }
- }
-
-let dbInitialized = false;
-
-async function autoInitDB(env) {
-    if (!env.DB || dbInitialized) return;
-    try {
-        // 1. 统计表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS emby_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT UNIQUE NOT NULL,
-            playing_count INTEGER DEFAULT 0,
-            playback_info_count INTEGER DEFAULT 0
-        )`).run();
-        // 2. 别名节点表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS alias_nodes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            keyword TEXT UNIQUE NOT NULL,
-            remark TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`).run();
-        // 3. 别名线路表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS alias_lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            node_id INTEGER NOT NULL,
-            origin TEXT NOT NULL,
-            weight INTEGER DEFAULT 1,
-            enabled INTEGER DEFAULT 1,
-            healthy INTEGER DEFAULT 1,
-            latency INTEGER DEFAULT 0,
-            fail_count INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (node_id) REFERENCES alias_nodes(id) ON DELETE CASCADE
-        )`).run();
-        // 4. 智能选线缓存表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS speed_region_cache (
-            region_code TEXT NOT NULL,
-            asn TEXT NOT NULL,
-            best_subdomain TEXT NOT NULL,
-            latency INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            expires_at DATETIME,
-            PRIMARY KEY (region_code, asn)
-        )`).run();
-        // 5. 测速日志表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS speed_test_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            region_code TEXT,
-            asn TEXT,
-            domain TEXT,
-            latency INTEGER,
-            tested_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`).run();
-        // 6. DNS 操作日志表
-        await env.DB.prepare(`CREATE TABLE IF NOT EXISTS dns_operation_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            operation TEXT,
-            domain TEXT,
-            status TEXT,
-            message TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`).run();
-        dbInitialized = true;
-    } catch (e) {
-        console.error('自动初始化数据库失败:', e);
-    }
+  if (!env.DB) return json({ error: "D1 数据库未绑定", data: null });
+  const statsResult = await env.DB.prepare(
+    `SELECT date, playing_count, playback_info_count FROM auto_emby_daily_stats
+     WHERE date >= date('now', '-30 days') ORDER BY date DESC`
+  ).all();
+  const totalResult = await env.DB.prepare(
+    `SELECT SUM(playing_count) as total_playing, SUM(playback_info_count) as total_playback_info
+     FROM auto_emby_daily_stats WHERE date >= date('now', '-30 days')`
+  ).first();
+  return json({
+    error: null,
+    data: {
+      total: { playing: totalResult?.total_playing || 0, playbackInfo: totalResult?.total_playback_info || 0 },
+      dailyStats: statsResult?.results || [],
+      lastUpdated: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+    },
+  });
 }
 
-// ===== 主入口 =====
+function normalizePrefix(p) {
+  return String(p || '').trim().toLowerCase().replace(/^\/+|\/+$/g, '');
+}
+
+function validatePrefix(prefix) {
+  const a = normalizePrefix(prefix);
+  if (!a || !/^[a-z0-9][a-z0-9_-]{0,62}$/i.test(a)) return '路径仅允许字母数字、下划线和连字符';
+  if (RESERVED_ALIASES.has(a.toLowerCase())) return '该路径为系统保留，不可使用';
+  return null;
+}
+
+async function handleAdminApi(request, env, url) {
+  if (!isAdmin(request, env)) return new Response('Unauthorized', { status: 401 });
+
+  if (url.pathname === '/admin/api/routes') {
+    if (request.method === 'GET') {
+      const { results } = await env.DB.prepare('SELECT * FROM routes ORDER BY sort_order, prefix').all();
+      return json(results || []);
+    }
+    if (request.method === 'POST') {
+      const data = await request.json();
+      const err = validatePrefix(data.prefix);
+      if (err) return json({ error: err }, 400);
+      const prefix = normalizePrefix(data.prefix);
+      let currentSortOrder = 0;
+      if (data.oldPrefix && data.oldPrefix !== data.prefix) {
+        const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(normalizePrefix(data.oldPrefix)).first();
+        if (oldRow) currentSortOrder = oldRow.sort_order;
+        await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(normalizePrefix(data.oldPrefix)).run();
+      } else {
+        const oldRow = await env.DB.prepare('SELECT sort_order FROM routes WHERE prefix = ?').bind(prefix).first();
+        if (oldRow) currentSortOrder = oldRow.sort_order;
+      }
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO routes (prefix, target, remark, cache_img, compat_mode, sort_order, target_latencies) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(
+        prefix, data.target, data.remark || '', data.cache_img || 'on', data.compat_mode || 'off', currentSortOrder, ''
+      ).run();
+      return json({ success: true });
+    }
+    if (request.method === 'DELETE') {
+      const prefix = url.searchParams.get('prefix');
+      if (!prefix) return json({ error: '缺少 prefix 参数' }, 400);
+      await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(normalizePrefix(prefix)).run();
+      return json({ success: true });
+    }
+  }
+
+  if (url.pathname === '/admin/api/speedtest/routes' && request.method === 'POST') {
+    const prefix = url.searchParams.get('prefix');
+    if (prefix) {
+      const results = await speedtestRouteTargets(env, normalizePrefix(prefix));
+      return json({ results });
+    }
+    const allResults = await speedtestAllRoutes(env);
+    return json({ results: allResults });
+  }
+
+  if (url.pathname === '/admin/api/speedtest/domains' && request.method === 'POST') {
+    const data = await speedtestOptimizedFromEdge();
+    return json(data);
+  }
+
+  return json({ error: 'Not found' }, 404);
+}
+
+async function resolveProxyTarget(request, env, url) {
+  const decodedPath = decodeURIComponent(url.pathname);
+  let upstreamUrls = [];
+  let enableCache = true;
+  let compatMode = false;
+  let matchedPrefix = null;
+  let needsSpeedTest = false;
+
+  const pathParts = decodedPath.split('/').filter(Boolean);
+  const prefix = normalizeAlias(pathParts[0]);
+  if (!prefix) return { error: new Response('Not Found', { status: 404 }) };
+
+  const route = await env.DB.prepare('SELECT * FROM routes WHERE prefix = ?').bind(prefix).first();
+  if (!route) return { error: new Response('404: 节点不存在', { status: 404 }) };
+
+  matchedPrefix = route.prefix;
+  enableCache = route.cache_img !== 'off';
+  compatMode = route.compat_mode === 'on';
+  const remainingPath = '/' + pathParts.slice(1).join('/');
+  let targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
+
+  if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) {
+    upstreamUrls = [remainingPath.substring(1) + url.search];
+    enableCache = true;
+  } else {
+    if (targetUrls.length > 1 && route.target_latencies) {
+      try {
+        const latencies = JSON.parse(route.target_latencies);
+        const hasAnyLatency = Object.values(latencies).some(v => typeof v === 'number' && v >= 0);
+        if (hasAnyLatency) {
+          targetUrls.sort((a, b) => {
+            const la = latencies[a];
+            const lb = latencies[b];
+            if (typeof la !== 'number' || la < 0) return 1;
+            if (typeof lb !== 'number' || lb < 0) return -1;
+            return la - lb;
+          });
+        }
+      } catch (_) {}
+    }
+    if (targetUrls.length > 1 && !route.target_latencies) {
+      needsSpeedTest = true;
+    }
+    upstreamUrls = targetUrls.map(t => t.replace(/\/+$/, '') + remainingPath + url.search);
+  }
+
+  return { upstreamUrls, enableCache, compatMode, matchedPrefix, needsSpeedTest };
+}
+
+function normalizeAlias(a) {
+  return String(a || '').trim().toLowerCase().replace(/^\/+|\/+$/g, '');
+}
+
+async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
+  const { enableCache = true, compatMode = false, matchedPrefix = null, needsSpeedTest = false } = opts;
+  const proxyOrigin = new URL(request.url).origin;
+
+  if (!upstreamUrls.length) return new Response('404: Target empty', { status: 404 });
+
+  if (needsSpeedTest && matchedPrefix && env.DB && ctx?.waitUntil) {
+    ctx.waitUntil(speedtestRouteTargets(env, matchedPrefix));
+  }
+
+  let firstUpstreamUrl;
+  try {
+    firstUpstreamUrl = new URL(upstreamUrls[0]);
+  } catch {
+    return new Response('Invalid upstream URL', { status: 500 });
+  }
+
+  const isPlaybackInfo = /\/PlaybackInfo/i.test(firstUpstreamUrl.pathname);
+  const isPlaying = firstUpstreamUrl.pathname.endsWith('/Sessions/Playing');
+
+  if (isPlaying && CONFIG.enableStats) {
+    ctx.waitUntil(recordStats(env, 'playing'));
+  }
+  if (isPlaybackInfo) {
+    ctx.waitUntil(recordStats(env, 'playback_info'));
+  }
+
+  if (matchedPrefix && env.DB && ctx?.waitUntil && isPlaybackInfo) {
+    const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
+    const nowTime = new Date(Date.now() + 8 * 3600000).toISOString().replace('T', ' ').split('.')[0];
+    const clientIp = request.headers.get('cf-connecting-ip') || 'Unknown';
+    const clientCountry = request.headers.get('cf-ipcountry') || 'Unknown';
+    const clientUa = request.headers.get('User-Agent') || 'Unknown';
+    try {
+      ctx.waitUntil(env.DB.batch([
+        env.DB.prepare(`INSERT INTO request_stats (prefix, date, count) VALUES (?, ?, 1) ON CONFLICT(prefix, date) DO UPDATE SET count = count + 1`).bind(matchedPrefix, todayStr),
+        env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix),
+        env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, ua) VALUES (?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientUa),
+      ]));
+    } catch(_) {}
+  }
+
+  const upgradeHeader = request.headers.get('Upgrade');
+  if (upgradeHeader?.toLowerCase() === 'websocket') {
+    return fetch(upstreamUrls[0], request);
+  }
+
+  let requestBody = null;
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    requestBody = await request.arrayBuffer();
+  }
+
+  let finalResponse = null;
+  let lastError = null;
+  let lastUpstreamUrl = null;
+
+  for (let i = 0; i < upstreamUrls.length; i++) {
+    let upstreamUrl;
+    try {
+      upstreamUrl = new URL(upstreamUrls[i]);
+    } catch {
+      lastError = new Error('Invalid target URL');
+      continue;
+    }
+
+    if (PIKPAK_DOMAINS.some((d) => upstreamUrl.hostname.endsWith(d))) {
+      return Response.redirect(new URL(upstreamUrl.pathname + upstreamUrl.search, CONFIG.pikpakProxyUrl).toString(), 301);
+    }
+    if (blocker.check(upstreamUrl.toString())) return Response.redirect('https://baidu.com', 301);
+
+    const colo = request.cf?.colo;
+    if (colo && JP_COLOS.includes(colo)) {
+      for (const suffix in DOMAIN_PROXY_RULES) {
+        if (upstreamUrl.host.endsWith(suffix)) {
+          upstreamUrl.hostname = DOMAIN_PROXY_RULES[suffix];
+          break;
+        }
+      }
+    }
+
+    const headers = new Headers(request.headers);
+    headers.set('Host', upstreamUrl.host);
+    headers.delete('Referer');
+    const clientIp = request.headers.get('cf-connecting-ip');
+    if (clientIp) {
+      headers.set('x-forwarded-for', clientIp);
+      headers.set('x-real-ip', clientIp);
+    }
+    if (compatMode) {
+      headers.set('Origin', upstreamUrl.origin);
+      headers.set('X-Forwarded-Proto', upstreamUrl.protocol.replace(':', ''));
+      headers.set('X-Forwarded-Host', upstreamUrl.host);
+    }
+
+    const isStaticOrImage = /\.(jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i.test(upstreamUrl.pathname) ||
+      /(\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i.test(upstreamUrl.pathname);
+
+    const fetchInit = { method: request.method, headers, redirect: compatMode ? 'follow' : 'manual' };
+    if (isStaticOrImage && enableCache) fetchInit.cf = { cacheEverything: true, cacheTtl: 86400 };
+    if (requestBody) fetchInit.body = requestBody;
+
+    try {
+      const response = await fetch(new Request(upstreamUrl.toString(), fetchInit));
+      if (!compatMode && [502, 503, 504].includes(response.status)) {
+        lastError = new Error(`HTTP ${response.status}`);
+        continue;
+      }
+      finalResponse = response;
+      lastUpstreamUrl = upstreamUrl;
+      break;
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
+  }
+
+  if (!finalResponse) {
+    return new Response('所有线路不可用: ' + (lastError?.message || 'Unknown'), { status: 502 });
+  }
+
+  const safePrefix = matchedPrefix ? `/${matchedPrefix}` : '';
+
+  if (!compatMode) {
+    const location = finalResponse.headers.get('Location');
+    if (location && finalResponse.status >= 300 && finalResponse.status < 400) {
+      try {
+        const redirectUrl = new URL(location, lastUpstreamUrl);
+        if (redirectUrl.hostname === lastUpstreamUrl.hostname) {
+          return fetch(redirectUrl.toString(), new Request(redirectUrl, { method: request.method, headers: finalResponse.headers, redirect: 'follow' }));
+        }
+        if (MANUAL_REDIRECT_DOMAINS.some((d) => redirectUrl.hostname.endsWith(d))) {
+          const rh = new Headers(finalResponse.headers);
+          rh.set('Location', redirectUrl.toString());
+          return new Response(finalResponse.body, { status: finalResponse.status, headers: rh });
+        }
+        if (matchedPrefix) {
+          const rh = new Headers(finalResponse.headers);
+          rh.set('Location', `${safePrefix}/${encodeURIComponent(redirectUrl.toString())}`);
+          return new Response(finalResponse.body, { status: finalResponse.status, headers: rh });
+        }
+        const fh = new Headers(request.headers);
+        fh.set('Host', redirectUrl.host);
+        fh.delete('Referer');
+        const cIp = request.headers.get('cf-connecting-ip');
+        if (cIp) {
+          fh.set('x-forwarded-for', cIp);
+          fh.set('x-real-ip', cIp);
+        }
+        return fetch(redirectUrl.toString(), { method: request.method, headers: fh, body: requestBody || undefined, redirect: 'follow' });
+      } catch (_) {}
+    }
+  }
+
+  const responseHeaders = new Headers(finalResponse.headers);
+  const contentType = finalResponse.headers.get('content-type') || '';
+
+  if (!compatMode && finalResponse.status === 200 && contentType.includes('json') && matchedPrefix) {
+    const urlPath = lastUpstreamUrl.pathname.toLowerCase();
+    if (urlPath.includes('playbackinfo')) {
+      try {
+        const data = await finalResponse.clone().json();
+        let modified = false;
+        if (data?.MediaSources) {
+          data.MediaSources.forEach((source) => {
+            ['DirectStreamUrl', 'TranscodingUrl'].forEach((key) => {
+              if (source[key]?.startsWith('http')) {
+                try {
+                  const mediaUrl = new URL(source[key]);
+                  const isDirectDomain = MANUAL_REDIRECT_DOMAINS.some(d => mediaUrl.hostname.endsWith(d));
+                  if (!isDirectDomain) {
+                    source[key] = proxyOrigin + safePrefix + '/' + source[key];
+                    modified = true;
+                  }
+                } catch (_) {
+                  source[key] = proxyOrigin + safePrefix + '/' + source[key];
+                  modified = true;
+                }
+              }
+            });
+          });
+        }
+        if (modified) {
+          responseHeaders.delete('Content-Length');
+          return new Response(JSON.stringify(data), { status: finalResponse.status, headers: responseHeaders });
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (!compatMode && finalResponse.status === 200 && matchedPrefix) {
+    const urlPath = lastUpstreamUrl.pathname.toLowerCase();
+    if (urlPath.endsWith('.m3u8')) {
+      try {
+        const text = await finalResponse.clone().text();
+        if (text.includes('http://') || text.includes('https://')) {
+          const modifiedText = text.replace(/(https?:\/\/[^\s]+)/g, (match) => {
+            try {
+              const mUrl = new URL(match);
+              const isDirectDomain = MANUAL_REDIRECT_DOMAINS.some(d => mUrl.hostname.endsWith(d));
+              return isDirectDomain ? match : proxyOrigin + safePrefix + '/' + match;
+            } catch (_) {
+              return proxyOrigin + safePrefix + '/' + match;
+            }
+          });
+          responseHeaders.delete('Content-Length');
+          return new Response(modifiedText, { status: finalResponse.status, headers: responseHeaders });
+        }
+      } catch (_) {}
+    }
+  }
+
+  if (CONFIG.cacheEnabled) {
+    if (contentType.includes('image/') || contentType.includes('text/css') || contentType.includes('application/javascript')) {
+      responseHeaders.set('Cache-Control', 'public, max-age=86400');
+    } else if (contentType.includes('video/') || contentType.includes('audio/')) {
+      responseHeaders.set('Cache-Control', 'public, max-age=3600');
+    } else {
+      responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+  }
+
+  responseHeaders.set('Access-Control-Allow-Origin', '*');
+  responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  responseHeaders.set('Access-Control-Allow-Headers', '*');
+  responseHeaders.set('X-Content-Type-Options', 'nosniff');
+
+  return new Response(finalResponse.body, {
+    status: finalResponse.status,
+    statusText: finalResponse.statusText,
+    headers: responseHeaders,
+  });
+}
+
+const PAGE_STYLE = `
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; color: #e5e7eb; margin: 0; padding: 0; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height: 100vh; }
+  .container { max-width: 1200px; margin: auto; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+  .card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); padding: 28px; border-radius: 20px; border: 1px solid rgba(148, 163, 184, 0.15); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); }
+  h1 { margin-top: 0; color: #60a5fa; font-size: 2em; font-weight: 700; letter-spacing: -0.02em; }
+  h2 { color: #94a3b8; border-bottom: 2px solid rgba(148, 163, 184, 0.15); padding-bottom: 12px; font-size: 1.2em; font-weight: 600; letter-spacing: -0.01em; }
+  code { background: rgba(96, 165, 250, 0.15); padding: 4px 10px; border-radius: 8px; color: #93c5fd; word-break: break-all; font-size: 0.9em; border: 1px solid rgba(96, 165, 250, 0.2); }
+  .muted { color: #94a3b8; font-size: 14px; }
+  .stat-row { display: flex; gap: 16px; flex-wrap: wrap; margin: 20px 0; }
+  .stat-card { flex: 1; min-width: 160px; background: linear-gradient(135deg, rgba(96, 165, 250, 0.1) 0%, rgba(59, 130, 246, 0.05) 100%); border: 1px solid rgba(96, 165, 250, 0.2); border-radius: 16px; padding: 20px; text-align: center; transition: transform 0.2s ease, box-shadow 0.2s ease; }
+  .stat-card:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(96, 165, 250, 0.2); }
+  .stat-val { font-size: 2em; font-weight: 700; color: #60a5fa; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(148, 163, 184, 0.15); }
+  th { color: #60a5fa; background: rgba(96, 165, 250, 0.08); font-weight: 600; }
+  tr.best td { background: rgba(34, 197, 94, 0.08); }
+  .tag { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .tag-fast { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
+  .tag-good { background: rgba(96, 165, 250, 0.2); color: #93c5fd; border: 1px solid rgba(96, 165, 250, 0.3); }
+  .tag-slow { background: rgba(251, 191, 36, 0.2); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
+  .tag-timeout { background: rgba(248, 113, 113, 0.2); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3); }
+  .edge-box { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
+  .edge-item { background: rgba(15, 23, 42, 0.5); padding: 16px; border-radius: 12px; font-size: 13px; border: 1px solid rgba(148, 163, 184, 0.1); }
+  .edge-item strong { color: #60a5fa; display: block; margin-bottom: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; background: linear-gradient(135deg, #60a5fa 0%, #3b82f6 100%); color: #fff; border-radius: 12px; text-decoration: none; font-weight: 600; border: none; cursor: pointer; font-size: 14px; transition: all 0.2s ease; box-shadow: 0 4px 15px rgba(96, 165, 250, 0.3); }
+  .btn:hover { background: linear-gradient(135deg, #93c5fd 0%, #60a5fa 100%); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(96, 165, 250, 0.4); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+  .warn { border: 2px solid rgba(248, 113, 113, 0.3); padding: 20px; border-radius: 16px; color: #fca5a5; background: rgba(248, 113, 113, 0.08); }
+  input[type=password], input[type=text], input[type=url], select { width: 100%; padding: 14px 16px; border: 2px solid rgba(148, 163, 184, 0.2); border-radius: 12px; background: rgba(15, 23, 42, 0.6); color: #e5e7eb; margin-bottom: 16px; font-size: 14px; transition: all 0.2s ease; }
+  input[type=password]:focus, input[type=text]:focus, input[type=url]:focus, select:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.1); }
+  label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 13px; color: #cbd5e1; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-row { margin-bottom: 20px; }
+  .toolbar { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; align-items: center; }
+  .route-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 20px; }
+  .route-item { background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.9) 100%); border: 1px solid rgba(148, 163, 184, 0.15); border-radius: 20px; padding: 24px; transition: all 0.3s ease; position: relative; overflow: hidden; }
+  .route-item::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 50%, #60a5fa 100%); opacity: 0; transition: opacity 0.3s ease; }
+  .route-item:hover { transform: translateY(-4px); box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4); border-color: rgba(96, 165, 250, 0.3); }
+  .route-item:hover::before { opacity: 1; }
+  .route-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .route-title { flex: 1; }
+  .route-name { font-size: 1.3em; font-weight: 700; color: #f1f5f9; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .route-path { color: #60a5fa; font-weight: 600; font-size: 0.95em; }
+  .route-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(148, 163, 184, 0.1); }
+  .btn-sm { padding: 8px 14px; font-size: 13px; border-radius: 10px; font-weight: 500; }
+  .btn-del { background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; box-shadow: none; }
+  .btn-del:hover { background: rgba(248, 113, 113, 0.25); }
+  .btn-outline { background: rgba(148, 163, 184, 0.15); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; box-shadow: none; }
+  .btn-outline:hover { background: rgba(148, 163, 184, 0.25); }
+  .target-list { margin-top: 12px; }
+  .target-row { background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(148, 163, 184, 0.1); border-radius: 12px; padding: 12px 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 12px; transition: all 0.2s ease; }
+  .target-row:hover { background: rgba(15, 23, 42, 0.8); border-color: rgba(148, 163, 184, 0.2); }
+  .target-url { color: #94a3b8; font-size: 13px; word-break: break-all; flex: 1; }
+  .target-latency { font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .route-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .meta-tag { font-size: 11px; padding: 3px 8px; background: rgba(148, 163, 184, 0.15); border-radius: 20px; color: #cbd5e1; }
+  .modal { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px); z-index: 1000; padding: 20px; overflow: auto; animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .modal.show { display: flex; align-items: center; justify-content: center; }
+  .modal-inner { background: linear-gradient(135deg, rgba(30, 41, 59, 0.95) 0%, rgba(15, 23, 42, 0.95) 100%); padding: 32px; border-radius: 24px; max-width: 560px; width: 100%; border: 1px solid rgba(148, 163, 184, 0.2); box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5); animation: slideUp 0.3s ease; }
+  @keyframes slideUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  .modal-header { margin-bottom: 24px; }
+  .modal-title { font-size: 1.5em; font-weight: 700; color: #f1f5f9; margin: 0; }
+  .search-box { position: relative; flex: 1; min-width: 240px; }
+  .search-box input { margin-bottom: 0; padding-left: 44px; }
+  .search-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: #64748b; pointer-events: none; }
+  .empty-state { text-align: center; padding: 48px 24px; color: #64748b; }
+  .empty-state-icon { font-size: 4em; margin-bottom: 16px; display: block; }
+  .empty-state-text { font-size: 1.1em; margin: 0; }
+  .form-group { margin-bottom: 20px; }
+  .form-group label { display: block; color: #cbd5e1; margin-bottom: 8px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-group input, .form-group select { width: 100%; padding: 14px 16px; border: 2px solid rgba(148, 163, 184, 0.2); border-radius: 12px; background: rgba(15, 23, 42, 0.6); color: #e5e7eb; font-size: 14px; transition: all 0.2s ease; margin-bottom: 0; }
+  .form-group input:focus, .form-group select:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.1); }
+  .form-hint { color: #64748b; font-size: 12px; margin: 8px 0 0; }
+  .form-hint span { color: #60a5fa; font-weight: 600; }
+  .modal-desc { color: #94a3b8; font-size: 14px; margin: 8px 0 0; }
+  .modal-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 28px; padding-top: 20px; border-top: 1px solid rgba(148, 163, 184, 0.1); }
+  .checkbox-label { display: flex !important; align-items: center; gap: 10px !important; text-transform: none !important; letter-spacing: normal !important; cursor: pointer; }
+  .checkbox-label input[type="checkbox"] { width: 18px !important; height: 18px; accent-color: #60a5fa; cursor: pointer; flex-shrink: 0; }
+  #toast { position: fixed; top: -60px; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); color: #f1f5f9; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 500; transition: top 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; border: 1px solid rgba(96, 165, 250, 0.3); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }
+  #toast.show { top: 20px; }
+  .target-inputs { display: flex; flex-direction: column; gap: 10px; }
+  .target-input-row { display: flex; gap: 8px; align-items: center; }
+  .target-input-row input { flex: 1; margin-bottom: 0; }
+  .target-input-row .btn-remove { background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; padding: 10px 14px; border-radius: 10px; cursor: pointer; font-size: 16px; flex-shrink: 0; }
+`;
+
+function buildFrontendHtml() {
+  const domainListJson = JSON.stringify(OPTIMIZED_DOMAINS);
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Emby 反代 | 智能优选</title><style>${PAGE_STYLE}</style></head><body>
+<div class="container">
+  <div class="card">
+    <h1>Emby 反向代理</h1>
+    <p class="muted">版本 ${CURRENT_VERSION} · 支持别名快捷入口与 CF 优选域名智能测速</p>
+    <p><a href="/admin" class="btn btn-outline">管理后台</a></p>
+  </div>
+  <div class="card">
+    <h2>当前边缘节点</h2>
+    <div id="edge-loading" class="muted">加载中...</div>
+    <div id="edge-info" class="edge-box" style="display:none"></div>
+  </div>
+  <div class="card">
+    <h2>优选域名测速（用户网络 → 优选入口）</h2>
+    <p class="muted">按延迟排序；同网段 IP 一小时内复用缓存结果</p>
+    <div class="toolbar"><button class="btn" id="btn-retest">重新测速</button><span id="speed-status" class="muted"></span></div>
+    <div id="domain-table-wrap"><p class="muted" id="domain-loading">正在测速...</p></div>
+  </div>
+  <div class="card">
+    <h2>使用格式</h2>
+    <p><code>https://你的域名/别名</code> 或 <code>https://你的域名/https://emby.example.com:8096</code></p>
+    <div class="warn">添加服务后请务必手动测试。恶意刷接口将封禁 IP。</div>
+  </div>
+  <div class="card">
+    <h2>使用统计（近30天）</h2>
+    <div id="stats-loading" class="muted">加载中...</div>
+    <div id="stats-body" style="display:none">
+      <div class="stat-row">
+        <div class="stat-card"><div>播放次数</div><div class="stat-val" id="st-play">0</div></div>
+        <div class="stat-card"><div>获取链接</div><div class="stat-val" id="st-pb">0</div></div>
+      </div>
+      <div id="daily-table"></div>
+    </div>
+  </div>
+</div>
+<script>
+const OPT_DOMAINS = ${domainListJson};
+const TAG = { fast:'极快', good:'良好', slow:'较慢', timeout:'超时' };
+const CLS = { fast:'tag-fast', good:'tag-good', slow:'tag-slow', timeout:'tag-timeout' };
+
+async function loadEdge() {
+  try {
+    const r = await fetch('/api/edge-info');
+    const d = await r.json();
+    document.getElementById('edge-loading').style.display = 'none';
+    const box = document.getElementById('edge-info');
+    box.style.display = 'grid';
+    box.innerHTML = [
+      ['客户端 IP', d.clientIp],
+      ['接入 POP', d.entryColo],
+      ['国家/地区', d.entryCountry + (d.entryCity ? ' / '+d.entryCity : '')],
+      ['边缘出口 IP', d.edgeIp],
+      ['落地 COLO', d.egressColo],
+    ].map(([k,v]) => '<div class="edge-item"><strong>'+k+'</strong>'+ (v||'—') +'</div>').join('');
+  } catch(e) { document.getElementById('edge-loading').textContent = '加载失败'; }
+}
+
+function renderDomainTable(results, best) {
+  const wrap = document.getElementById('domain-table-wrap');
+  if (!results.length) { wrap.innerHTML = '<p class="muted">无数据</p>'; return; }
+  let html = '<table><thead><tr><th>#</th><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
+  results.forEach((r, i) => {
+    const host = r.host || (r.subdomain+'.'+r.domain);
+    const isBest = best && best === host;
+    html += '<tr class="'+(isBest?'best':'')+'"><td>'+(i+1)+'</td><td>'+ (r.name||r.display_name||'') +'</td><td><code>'+host+'</code></td><td>'+(r.latency>=0?r.latency+' ms':'—')+'</td><td><span class="tag '+CLS[r.status||'timeout']+'">'+(TAG[r.status]||'—')+'</span></td></tr>';
+  });
+  wrap.innerHTML = html + '</tbody></table>';
+}
+
+function pingMs(url, timeout) {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    const timer = setTimeout(() => resolve(-1), timeout || 7000);
+    const done = (ms) => { clearTimeout(timer); resolve(ms >= 0 && ms < (timeout || 7000) ? ms : -1); };
+    fetch(url, { mode: 'no-cors', cache: 'no-store', credentials: 'omit' })
+      .then(() => done(Math.round(performance.now() - t0)))
+      .catch(() => {
+        const img = new Image();
+        const t1 = performance.now();
+        const t2 = setTimeout(() => done(-1), 5000);
+        const end = () => { clearTimeout(t2); done(Math.round(performance.now() - t1)); };
+        img.onload = end;
+        img.onerror = end;
+        img.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+      });
+  });
+}
+
+async function probeDomain(item) {
+  const host = item.subdomain + '.' + item.domain;
+  const paths = ['/cdn-cgi/trace', '/favicon.ico', '/'];
+  for (const p of paths) {
+    const ms = await pingMs('https://' + host + p, 7000);
+    if (ms >= 0) {
+      const status = ms < 100 ? 'fast' : ms < 300 ? 'good' : 'slow';
+      return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: ms, status, source: 'client' };
+    }
+  }
+  try {
+    const r = await fetch('/api/ping-host?host=' + encodeURIComponent(host));
+    const d = await r.json();
+    if (d.ms >= 0) {
+      const status = d.ms < 100 ? 'fast' : d.ms < 300 ? 'good' : 'slow';
+      return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: d.ms, status, source: 'edge' };
+    }
+  } catch (_) {}
+  return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: -1, status: 'timeout', source: 'none' };
+}
+
+function finalizeResults(rows) {
+  rows.forEach(r => { if (r.latency >= 0) r.status = r.latency < 100 ? 'fast' : r.latency < 300 ? 'good' : 'slow'; else r.status = 'timeout'; });
+  rows.sort((a,b) => { if (a.latency<0) return 1; if (b.latency<0) return -1; return a.latency-b.latency; });
+  return rows;
+}
+
+async function runDomainSpeed(force) {
+  const st = document.getElementById('speed-status');
+  const wrap = document.getElementById('domain-table-wrap');
+  if (!force) {
+    try {
+      const cached = await fetch('/api/domains/speed');
+      const data = await cached.json();
+      if (data.cached && data.results?.length) {
+        st.textContent = '已使用缓存（约1小时有效）';
+        renderDomainTable(data.results, data.best);
+        return;
+      }
+    } catch(e) {}
+  }
+  st.textContent = '加载边缘测速...';
+  wrap.innerHTML = '<p class="muted">测速中...</p>';
+  let results = [];
+  try {
+    const er = await fetch('/api/domains/speed?edge=1');
+    const ed = await er.json();
+    if (ed.results?.length) {
+      results = ed.results;
+      finalizeResults(results);
+      renderDomainTable(results, ed.best);
+      st.textContent = '边缘测速完成，正在用您的网络复测...';
+    }
+  } catch (_) {}
+  const clientResults = await Promise.all(OPT_DOMAINS.map(probeDomain));
+  finalizeResults(clientResults);
+  const clientOk = clientResults.filter(r => r.latency >= 0).length;
+  if (clientOk > 0) {
+    results = clientResults;
+    st.textContent = '浏览器测速完成（' + clientOk + '/12 可用）';
+    try {
+      await fetch('/api/domains/speed', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ results }) });
+    } catch(e) {}
+  } else if (!results.length) {
+    st.textContent = '测速失败，请检查网络或稍后重试';
+  }
+  const best = results.find(r => r.latency >= 0);
+  renderDomainTable(results, best ? best.host : null);
+  if (best && clientOk > 0) st.textContent += ' · 推荐: ' + best.host;
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/stats');
+    const data = await r.json();
+    if (data.error) { document.getElementById('stats-loading').textContent = data.error; return; }
+    document.getElementById('stats-loading').style.display = 'none';
+    document.getElementById('stats-body').style.display = 'block';
+    document.getElementById('st-play').textContent = data.data.total.playing;
+    document.getElementById('st-pb').textContent = data.data.total.playbackInfo;
+    const daily = (data.data.dailyStats||[]).slice(0,10);
+    let t = '<table><tr><th>日期</th><th>播放</th><th>链接</th></tr>';
+    daily.forEach(s => { t += '<tr><td>'+s.date+'</td><td>'+s.playing_count+'</td><td>'+s.playback_info_count+'</td></tr>'; });
+    document.getElementById('daily-table').innerHTML = t + '</table>';
+  } catch(e) { document.getElementById('stats-loading').textContent = '统计加载失败'; }
+}
+
+document.getElementById('btn-retest').onclick = () => runDomainSpeed(true);
+loadEdge(); runDomainSpeed(false); loadStats();
+</script></body></html>`;
+}
+
+function buildLoginHtml() {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>管理登录</title><style>${PAGE_STYLE}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;}
+.login-box{background:#252830;padding:40px;border-radius:16px;max-width:360px;width:100%;border-top:4px solid #0070f3;}
+</style></head><body><div class="login-box">
+<h1 style="text-align:center">管理后台</h1>
+<p class="muted" style="text-align:center">请输入 Worker 环境变量 ADMIN_TOKEN</p>
+<input type="password" id="tokenInput" placeholder="请输入管理密钥" onkeydown="if(event.key==='Enter')login()">
+<p id="loginErr" style="color:#e06c75;font-size:14px;min-height:1.2em"></p>
+<button class="btn" style="width:100%" id="loginBtn" onclick="login()">登录</button>
+<script>
+async function login(){
+  const t=document.getElementById('tokenInput').value.trim();
+  const err=document.getElementById('loginErr');
+  const btn=document.getElementById('loginBtn');
+  err.textContent='';
+  if(!t){ err.textContent='请输入密钥'; return; }
+  btn.disabled=true; btn.textContent='验证中...';
+  try{
+    const r=await fetch('/admin/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});
+    const d=await r.json();
+    if(d.ok){ location.href='/admin'; return; }
+    err.textContent=d.error||'登录失败';
+  }catch(e){ err.textContent='请求失败: '+e.message; }
+  btn.disabled=false; btn.textContent='登录';
+}
+</script></div></body></html>`;
+}
+
+function buildAdminHtml() {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>管理后台</title><style>${PAGE_STYLE}</style></head><body>
+<div id="toast"></div>
+<div class="container">
+  <div class="card">
+    <div class="toolbar" style="justify-content:space-between">
+      <h1 style="margin:0">🎛️ 管理后台</h1>
+      <div style="display:flex;gap:10px">
+        <a href="/" class="btn btn-outline btn-sm">🏠 首页</a>
+        <button class="btn btn-del btn-sm" onclick="logout()">🚪 退出</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:16px">
+      <h2 style="border:none;margin:0;padding:0">📦 路由管理</h2>
+      <div class="toolbar" style="margin:0">
+        <button class="btn" onclick="openRouteModal()">➕ 添加路由</button>
+        <button class="btn btn-outline" onclick="speedtestAll()">⚡ 全局测速</button>
+        <div class="search-box">
+          <span class="search-icon">🔍</span>
+          <input type="text" id="routeSearch" placeholder="搜索备注或路径..." oninput="filterRoutes()">
+        </div>
+      </div>
+    </div>
+    <div id="routeList" class="route-grid"><p class="muted">加载中...</p></div>
+  </div>
+
+  <div class="card">
+    <h2>⚡ 优选域名测速</h2>
+    <p class="muted" style="margin-bottom:16px">测试边缘节点到优选入口的延迟</p>
+    <button class="btn" onclick="testDomains()">🚀 开始测速</button>
+    <div id="adminDomainResult" style="margin-top:20px"></div>
+  </div>
+</div>
+
+<div id="modalRoute" class="modal">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h2 class="modal-title" id="routeModalTitle">➕ 添加路由</h2>
+      <p class="modal-desc">创建路由后可通过 /路径 快捷访问目标服务</p>
+    </div>
+    <input type="hidden" id="oldPrefix">
+    <div class="form-group">
+      <label>备注名</label>
+      <input id="routeRemark" placeholder="例如：我的 Emby 服务器">
+    </div>
+    <div class="form-group">
+      <label>路径 (prefix)</label>
+      <input id="routePrefix" placeholder="myemby">
+      <p class="form-hint">访问路径: https://你的域名/<span id="prefixPreview">myemby</span></p>
+    </div>
+    <div class="form-group">
+      <label>目标线路 (target)</label>
+      <div id="targetInputs" class="target-inputs">
+        <div class="target-input-row">
+          <input type="url" class="target-url-input" placeholder="主线路地址 (如: https://emby.example.com:8096)">
+          <button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>
+        </div>
+      </div>
+      <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="addTargetInput()">➕ 添加备用线路</button>
+      <p class="form-hint">多个线路按顺序 failover，测速后按延迟排序优选</p>
+    </div>
+    <div class="form-group">
+      <label class="checkbox-label">
+        <input type="checkbox" id="routeCache" checked> 启用图片/静态资源缓存
+      </label>
+      <label class="checkbox-label" style="margin-top:12px">
+        <input type="checkbox" id="routeCompat"> 兼容模式
+      </label>
+      <p class="form-hint">兼容模式适用于部分无法正常播放的 Emby 服务器，开启后不重写媒体流地址，由客户端直连源站播放</p>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('modalRoute')">取消</button>
+      <button class="btn" onclick="saveRoute()">💾 保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let allRoutes=[];
+
+function closeModal(id){document.getElementById(id).classList.remove('show');}
+function openModal(id){document.getElementById(id).classList.add('show');}
+
+function logout(){document.cookie='admin_token=;path=/;max-age=0';location.reload();}
+
+function showToast(msg){
+  var t=document.getElementById('toast');
+  if(!t){t=document.createElement('div');t.id='toast';document.body.appendChild(t);}
+  t.textContent=msg;t.classList.add('show');
+  setTimeout(function(){t.classList.remove('show');},2500);
+}
+
+function getLatencyInfo(ms){
+  if(ms<0)return {text:'超时',cls:'tag-timeout',color:'#f87171'};
+  if(ms<100)return {text:'极快',cls:'tag-fast',color:'#4ade80'};
+  if(ms<300)return {text:'良好',cls:'tag-good',color:'#93c5fd'};
+  return {text:'较慢',cls:'tag-slow',color:'#fbbf24'};
+}
+
+function addTargetInput(){
+  var container=document.getElementById('targetInputs');
+  var row=document.createElement('div');
+  row.className='target-input-row';
+  row.innerHTML='<input type="url" class="target-url-input" placeholder="备用线路地址"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
+  container.appendChild(row);
+}
+
+function removeTargetInput(btn){
+  var container=document.getElementById('targetInputs');
+  if(container.querySelectorAll('.target-input-row').length>1){
+    btn.parentElement.remove();
+  }
+}
+
+async function loadRoutes(){
+  const r=await fetch('/admin/api/routes');
+  if(r.status===401){location.reload();return;}
+  allRoutes=await r.json();
+  renderRoutes(allRoutes);
+}
+
+function parseLatencies(latStr){
+  if(!latStr)return {};
+  try{return JSON.parse(latStr);}catch(e){return {};}
+}
+
+function renderRoutes(list){
+  const el=document.getElementById('routeList');
+  if(!list.length){
+    el.innerHTML='<div class="empty-state" style="grid-column:1/-1"><span class="empty-state-icon">📦</span><p class="empty-state-text">暂无路由，点击上方按钮添加</p></div>';
+    return;
+  }
+  el.innerHTML=list.map(r=>{
+    const targets=r.target.split(',').map(s=>s.trim()).filter(Boolean);
+    const latencies=parseLatencies(r.target_latencies);
+    const remarkName=r.remark||'未命名';
+    const cacheStatus=r.cache_img!=='off';
+    const compatStatus=r.compat_mode==='on';
+
+    let targetsHtml='';
+    targets.forEach((t,idx)=>{
+      const lat=latencies[t];
+      const latInfo=getLatencyInfo(lat);
+      const tag=idx===0?'<span style="color:#4ade80;font-weight:bold;">[主]</span>':'<span style="color:#fbbf24;font-weight:bold;">[备'+idx+']</span>';
+      const latDisplay=typeof lat==='number'&&lat>=0?'<span class="target-latency" style="color:'+latInfo.color+'">'+lat+'ms <span class="tag '+latInfo.cls+'">'+latInfo.text+'</span></span>':'<span class="target-latency" style="color:#64748b">未测速</span>';
+      targetsHtml+='<div class="target-row">'+tag+' <span class="target-url"><code>'+t+'</code></span>'+latDisplay+'</div>';
+    });
+
+    return '<div class="route-item" data-search="'+(remarkName+' '+r.prefix).toLowerCase()+'">'+
+      '<div class="route-header">'+
+        '<div class="route-title">'+
+          '<h3 class="route-name">'+remarkName+'</h3>'+
+          '<span class="route-path">/'+r.prefix+'</span>'+
+        '</div>'+
+      '</div>'+
+      '<div class="target-list">'+targetsHtml+'</div>'+
+      '<div class="route-meta">'+
+        (cacheStatus?'<span class="meta-tag">🖼️ 缓存开启</span>':'<span class="meta-tag">缓存关闭</span>')+
+        (compatStatus?'<span class="meta-tag" style="background:rgba(251,191,36,0.2);color:#fbbf24">🔧 兼容模式</span>':'')+
+        (r.last_play?'<span class="meta-tag">📺 '+r.last_play+'</span>':'')+
+      '</div>'+
+      '<div class="route-actions">'+
+        '<button class="btn btn-sm btn-outline" onclick="speedtestRoute(\\''+r.prefix+'\\')">⚡ 测速</button>'+
+        '<button class="btn btn-sm btn-outline" onclick="editRoute(\\''+r.prefix+'\\')">✏️ 编辑</button>'+
+        '<button class="btn btn-sm btn-del" onclick="delRoute(\\''+r.prefix+'\\')">🗑️ 删除</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
+
+function filterRoutes(){
+  const q=document.getElementById('routeSearch').value.toLowerCase();
+  document.querySelectorAll('.route-item').forEach(c=>{
+    c.style.display=(!q||c.dataset.search.includes(q))?'block':'none';
+  });
+}
+
+function openRouteModal(){
+  document.getElementById('oldPrefix').value='';
+  document.getElementById('routeRemark').value='';
+  document.getElementById('routePrefix').value='';
+  document.getElementById('routeCache').checked=true;
+  document.getElementById('routeCompat').checked=false;
+  document.getElementById('prefixPreview').textContent='myemby';
+  document.getElementById('routeModalTitle').textContent='➕ 添加路由';
+  var container=document.getElementById('targetInputs');
+  container.innerHTML='<div class="target-input-row"><input type="url" class="target-url-input" placeholder="主线路地址 (如: https://emby.example.com:8096)"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button></div>';
+  openModal('modalRoute');
+}
+
+function editRoute(prefix){
+  const r=allRoutes.find(x=>x.prefix===prefix);
+  if(!r)return;
+  document.getElementById('oldPrefix').value=r.prefix;
+  document.getElementById('routeRemark').value=r.remark||'';
+  document.getElementById('routePrefix').value=r.prefix;
+  document.getElementById('routeCache').checked=r.cache_img!=='off';
+  document.getElementById('routeCompat').checked=r.compat_mode==='on';
+  document.getElementById('prefixPreview').textContent=r.prefix;
+  document.getElementById('routeModalTitle').textContent='✏️ 编辑路由';
+
+  var container=document.getElementById('targetInputs');
+  container.innerHTML='';
+  var targets=r.target.split(',').map(s=>s.trim()).filter(Boolean);
+  targets.forEach(function(t){
+    var row=document.createElement('div');
+    row.className='target-input-row';
+    row.innerHTML='<input type="url" class="target-url-input" value="'+t+'"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
+    container.appendChild(row);
+  });
+  if(!targets.length){
+    var row=document.createElement('div');
+    row.className='target-input-row';
+    row.innerHTML='<input type="url" class="target-url-input" placeholder="主线路地址"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
+    container.appendChild(row);
+  }
+  openModal('modalRoute');
+}
+
+async function saveRoute(){
+  const oldPrefix=document.getElementById('oldPrefix').value;
+  const remark=document.getElementById('routeRemark').value.trim();
+  const prefix=document.getElementById('routePrefix').value.trim().replace(/^\\/+|\\/+$/g,'');
+  const cache_img=document.getElementById('routeCache').checked?'on':'off';
+  const compat_mode=document.getElementById('routeCompat').checked?'on':'off';
+
+  var targetInputs=document.querySelectorAll('.target-url-input');
+  var targets=[];
+  targetInputs.forEach(function(inp){
+    var val=inp.value.trim().replace(/\\/$/g,'');
+    if(val)targets.push(val);
+  });
+  const target=targets.join(',');
+
+  if(!prefix){showToast('请输入路径');return;}
+  if(!target){showToast('请至少填写一个主线路地址');return;}
+
+  document.getElementById('prefixPreview').textContent=prefix||'myemby';
+
+  const r=await fetch('/admin/api/routes',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({oldPrefix:oldPrefix,prefix:prefix,target:target,remark:remark,cache_img:cache_img,compat_mode:compat_mode})
+  });
+  const j=await r.json();
+  if(!r.ok){showToast(j.error||'保存失败');return;}
+  closeModal('modalRoute');
+  showToast('保存成功');
+  loadRoutes();
+}
+
+async function delRoute(prefix){
+  if(!confirm('确定删除路由 /'+prefix+' ？'))return;
+  await fetch('/admin/api/routes?prefix='+encodeURIComponent(prefix),{method:'DELETE'});
+  showToast('已删除');
+  loadRoutes();
+}
+
+async function speedtestRoute(prefix){
+  showToast('测速中...');
+  const r=await fetch('/admin/api/speedtest/routes?prefix='+encodeURIComponent(prefix),{method:'POST'});
+  const d=await r.json();
+  const ok=(d.results||[]).filter(x=>x.latency>=0).length;
+  showToast('测速完成，'+ok+'条线路可用');
+  loadRoutes();
+}
+
+async function speedtestAll(){
+  showToast('全局测速中，请耐心等待...');
+  const r=await fetch('/admin/api/speedtest/routes',{method:'POST'});
+  const d=await r.json();
+  showToast('全局测速完成');
+  loadRoutes();
+}
+
+async function testDomains(){
+  document.getElementById('adminDomainResult').innerHTML='<p class="muted">测速中...</p>';
+  const r=await fetch('/admin/api/speedtest/domains',{method:'POST'});
+  const d=await r.json();
+  let h='<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
+  (d.results||[]).forEach(x=>{
+    const status=getLatencyInfo(x.latency);
+    h+='<tr'+(d.best===x.host?' class="best"':'')+'>'+
+      '<td>'+(x.name||'—')+'</td>'+
+      '<td><code>'+x.host+'</code></td>'+
+      '<td>'+(x.latency>=0?x.latency+'ms':'超时')+'</td>'+
+      '<td><span class="tag '+status.cls+'">'+status.text+'</span></td>'+
+    '</tr>';
+  });
+  document.getElementById('adminDomainResult').innerHTML=h+'</tbody></table>';
+}
+
+document.getElementById('routePrefix').addEventListener('input',function(){
+  document.getElementById('prefixPreview').textContent=this.value.trim()||'myemby';
+});
+
+loadRoutes();
+</script>
+</body></html>`;
+}
+
 export default {
   async fetch(request, env, ctx) {
-    // 自动初始化数据库表（如果尚未初始化）
-    ctx.waitUntil(autoInitDB(env));
+    const url = new URL(request.url);
 
-    // --- 首次请求时自动创建智能选线 DNS 记录 ---
-    ctx.waitUntil(ensureSpeedDnsRecords(env));
-
-    const workerUrl = new URL(request.url);
-
-    // --- 子域名自动路由（最高优先级） ---
-    var hostname = request.headers.get('host') || workerUrl.hostname;
-    hostname = hostname.split(':')[0];
-    var hostParts = hostname.split('.');
-    var subdomain = hostParts.length >= 3 ? hostParts[0] : '';
-
-    // --- 智能选线内部端点（所有子域名都支持） ---
-    if (workerUrl.pathname === '/__speed_ping') {
-      return handleSpeedPing();
-    }
-    if (workerUrl.pathname === '/__speed_report') {
-      return handleSpeedReport(request, env);
-    }
-
-    // --- proxy.your-domain.com：智能选线入口 ---
-    // 用户访问 proxy.your-domain.com/emby.com → 测速或重定向到最优 proxyN
-    if (subdomain === 'proxy') {
-      // 管理后台
-      if (workerUrl.pathname.startsWith('/admin')) {
-        return handleAdmin(request, env, workerUrl, ctx);
-      }
-      // 根路径显示首页
-      if (workerUrl.pathname === '/') {
-        return new Response(FRONTEND_HTML, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' }
-        });
-      }
-      // 其他静态端点
-      if (workerUrl.pathname === '/favicon.ico') {
-        return new Response('', { headers: { 'Content-Type': 'image/x-icon' } });
-      }
-      if (workerUrl.pathname === '/health') {
-        return new Response(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString(), region: request.cf?.colo }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      if (workerUrl.pathname === '/stats') {
-        return handleStatsRequest(env);
-      }
-
-      // 别名快捷入口查询（优先于智能选线和普通代理）
-      const aliasResult = await lookupAlias(workerUrl.pathname, env);
-      if (aliasResult) {
-        return handleAliasProxy(request, env, ctx, aliasResult);
-      }
-
-      // 直接路径反代：/emby.com 或 /emby.com/path
-      var targetPath = workerUrl.pathname.substring(1); // 去掉开头的 /
-      if (targetPath) {
-        return executeProxy(request, env, ctx);
-      }
-    }
-
-    // --- proxy1~proxyN.your-domain.com：实际代理子域名 ---
-    // 这些子域名已经 CNAME 到了优选域名，直接走代理逻辑
-    var isProxyLine = SPEED_LINES.some(function(l) { return l.subdomain === subdomain; });
-
-    if (isProxyLine) {
-      // 管理后台（仅 proxy 主域名）
-      // 别名查询
-      const aliasResult = await lookupAlias(workerUrl.pathname, env);
-      if (aliasResult) {
-        return handleAliasProxy(request, env, ctx, aliasResult);
-      }
-      // 直接走代理
-      return executeProxy(request, env, ctx);
-    }
-
-    // --- 其他子域名：别名快捷入口（如 myemby.example.com） ---
-    if (subdomain && subdomain !== 'www') {
-      var aliasCheck = await lookupAlias('/' + subdomain, env);
-      if (aliasCheck) {
-        var newPath = '/' + subdomain + workerUrl.pathname;
-        if (workerUrl.pathname === '/') newPath = '/' + subdomain;
-        workerUrl.pathname = newPath;
-      }
-    }
-
-    // --- 管理后台路由 ---
-    if (workerUrl.pathname.startsWith('/admin')) {
-      return handleAdmin(request, env, workerUrl, ctx);
-    }
-
-    // --- 静态端点 ---
-    if (workerUrl.pathname === '/') {
-      return new Response(FRONTEND_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+        },
       });
     }
-    if (workerUrl.pathname === '/favicon.ico') {
-      return new Response('', { headers: { 'Content-Type': 'image/x-icon' } });
-    }
-    if (workerUrl.pathname.startsWith('/cdn-cgi/')) {
-      return new Response('Not Found', { status: 404 });
-    }
-    if (workerUrl.pathname === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString(), region: request.cf?.colo }), {
-        headers: { 'Content-Type': 'application/json' }
+
+    if (env.DB) await initDatabase(env);
+
+    if (url.pathname === '/__client_rtt__') {
+      return new Response(null, {
+        status: 204,
+        headers: { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' },
       });
     }
-    if (workerUrl.pathname === '/stats') {
-      return handleStatsRequest(env);
+
+    if (url.pathname === '/') return html(buildFrontendHtml());
+    if (url.pathname === '/favicon.ico') return new Response('', { headers: { 'Content-Type': 'image/x-icon' } });
+    if (url.pathname.startsWith('/cdn-cgi/')) return new Response('Not Found', { status: 404 });
+
+    if (url.pathname === '/health') {
+      return json({ status: 'ok', version: CURRENT_VERSION, colo: request.cf?.colo, timestamp: new Date().toISOString() });
     }
 
-    // --- 别名快捷入口查询 ---
-    const aliasResult = await lookupAlias(workerUrl.pathname, env);
-    if (aliasResult) {
-      return handleAliasProxy(request, env, ctx, aliasResult);
+    if (url.pathname === '/stats') return handleStatsRequest(env);
+
+    if (url.pathname === '/api/edge-info') return json(await getEdgeInfo(request));
+
+    if (url.pathname === '/api/ping-host') {
+      const host = (url.searchParams.get('host') || '').replace(/^https?:\/\//, '').split('/')[0];
+      if (!host) return json({ ms: -1, error: 'missing host' });
+      const ms = await speedtestUrl(`https://${host}/cdn-cgi/trace`, 5000);
+      return json({ ms, host });
     }
 
-    // --- 原始代理逻辑 ---
-    return executeProxy(request, env, ctx);
+    if (url.pathname === '/api/domains/speed') {
+      const cacheKey = getClientCacheKey(request);
+      if (request.method === 'GET') {
+        if (url.searchParams.get('edge') === '1') {
+          const data = await speedtestOptimizedFromEdge();
+          const results = data.results.map((r) => ({
+            subdomain: r.subdomain, domain: r.domain, name: r.name, host: r.host,
+            latency: r.latency, status: r.status, source: 'edge',
+          }));
+          return json({ cached: false, edge: true, best: data.best, results });
+        }
+        if (!env.DB) return json({ cached: false, cacheKey, results: [] });
+        const cached = await loadDomainSpeedCache(env, cacheKey);
+        if (cached) return json(cached);
+        return json({ cached: false, cacheKey, results: [], domains: OPTIMIZED_DOMAINS });
+      }
+      if (request.method === 'POST') {
+        if (!env.DB) return json({ success: false, error: 'DB not bound' }, 500);
+        const body = await request.json();
+        const rows = (body.results || []).map((r) => ({
+          subdomain: r.subdomain,
+          domain: r.domain,
+          name: r.name || r.display_name,
+          latency: r.latency,
+          status: r.status || latencyStatus(r.latency),
+        }));
+        await saveDomainSpeedCache(env, cacheKey, rows);
+        const best = rows.filter((r) => r.latency >= 0).sort((a, b) => a.latency - b.latency)[0];
+        return json({ success: true, best: best ? `${best.subdomain}.${best.domain}` : null });
+      }
+    }
+
+    if (url.pathname === '/admin/api/login' && request.method === 'POST') {
+      try {
+        const body = await request.json();
+        return adminLoginResponse(request, env, String(body.token || '').trim());
+      } catch (e) {
+        return json({ ok: false, error: e.message }, 400);
+      }
+    }
+
+    if (url.pathname === '/admin' || url.pathname === '/admin/') {
+      if (!isAdmin(request, env)) return html(buildLoginHtml());
+      return html(buildAdminHtml());
+    }
+
+    if (url.pathname.startsWith('/admin/api/')) {
+      if (!isAdmin(request, env)) return new Response('Unauthorized', { status: 401 });
+      if (!env.DB) return json({ error: 'DB 未绑定' }, 500);
+      return handleAdminApi(request, env, url);
+    }
+
+    const pathFirst = url.pathname.split('/').filter(Boolean)[0]?.toLowerCase();
+    const looksLikeDirectUrl = url.pathname.startsWith('/http://') || url.pathname.startsWith('/https://') ||
+      (pathFirst && (pathFirst.includes('.') || pathFirst.includes(':')));
+
+    if (looksLikeDirectUrl) {
+      let path = url.pathname.substring(1);
+      if (path.startsWith('/')) return new Response('Invalid proxy format', { status: 400 });
+      path = path.replace(/^(https?)\/(?!\/)/, '$1://');
+      if (!path.startsWith('http')) path = 'https://' + path;
+      try {
+        const upstreamUrl = new URL(path);
+        upstreamUrl.search = url.search;
+        return proxyDirectUrl(request, env, ctx, [upstreamUrl.toString()], { enableCache: true });
+      } catch {
+        return new Response('Invalid URL format', { status: 400 });
+      }
+    }
+
+    if (!env.DB) {
+      return new Response('D1 数据库未绑定，路由反代不可用。仍可使用 /https://... 格式。', { status: 500 });
+    }
+
+    const resolved = await resolveProxyTarget(request, env, url);
+    if (resolved.error) return resolved.error;
+
+    return proxyDirectUrl(request, env, ctx, resolved.upstreamUrls, {
+      enableCache: resolved.enableCache,
+      compatMode: resolved.compatMode,
+      matchedPrefix: resolved.matchedPrefix,
+      needsSpeedTest: resolved.needsSpeedTest,
+    });
   },
 };
