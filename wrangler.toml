@@ -1,4 +1,4 @@
-name = "emby-proxy"
+name = "fd"
 main = "worker.js"
 compatibility_date = "2025-05-15"
 
@@ -7,5 +7,5 @@ BASE_DOMAIN = "example.com"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "emby-proxy-db"
-database_id = ""
+database_name = "fd"
+database_id = "5f966506-c2c9-46b0-8f85-9c6ba639c568"
