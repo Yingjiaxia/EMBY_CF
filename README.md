@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=modern%20server%20room%20with%20blue%20neon%20lights%2C%20cloud%20computing%2C%20network%20cables%2C%20dark%20atmosphere%2C%20cinematic&image_size=landscape_16_9" alt="Emby Proxy Worker Banner" width="100%">
-</p>
-
 <h1 align="center">🎬 Emby Proxy Worker</h1>
 
 <p align="center">
