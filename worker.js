@@ -1231,10 +1231,14 @@ function openModal(id) { document.getElementById(id).classList.add('show'); }
 function logout() { document.cookie = 'admin_token=;path=/;max-age=0'; location.reload(); }
 
 async function loadRoutes() {
-  const r = await fetch('/admin/api/routes');
-  if (r.status === 401) { location.reload(); return; }
-  allRoutes = await r.json();
-  renderRoutes(allRoutes);
+  try {
+    const r = await fetch('/admin/api/routes');
+    if (r.status === 401) { location.reload(); return; }
+    allRoutes = await r.json();
+    renderRoutes(allRoutes);
+  } catch (e) {
+    document.getElementById('routeList').innerHTML = '<p class="muted">加载失败: ' + e.message + '</p>';
+  }
 }
 
 function renderRoutes(list) {
@@ -1342,12 +1346,18 @@ async function delRoute(prefix) {
 }
 
 async function loadDomains() {
-  const r = await fetch('/admin/api/optimized-domains');
-  if (r.status === 401) { location.reload(); return; }
-  const d = await r.json();
-  if (d.success) {
-    allDomains = d.domains;
-    renderDomains(allDomains);
+  try {
+    const r = await fetch('/admin/api/optimized-domains');
+    if (r.status === 401) { location.reload(); return; }
+    const d = await r.json();
+    if (d.success) {
+      allDomains = d.domains;
+      renderDomains(allDomains);
+    } else {
+      document.getElementById('domainList').innerHTML = '<p class="muted">加载失败</p>';
+    }
+  } catch (e) {
+    document.getElementById('domainList').innerHTML = '<p class="muted">加载失败: ' + e.message + '</p>';
   }
 }
 
@@ -1455,12 +1465,18 @@ async function testDomains() {
 }
 
 async function loadDNSConfig() {
-  const r = await fetch('/admin/api/dns-config');
-  if (r.status === 401) { location.reload(); return; }
-  const d = await r.json();
-  if (d.success) {
-    dnsConfig = d.config;
-    renderDNSConfig(d.config, d.zones);
+  try {
+    const r = await fetch('/admin/api/dns-config');
+    if (r.status === 401) { location.reload(); return; }
+    const d = await r.json();
+    if (d.success) {
+      dnsConfig = d.config;
+      renderDNSConfig(d.config, d.zones);
+    } else {
+      document.getElementById('dnsConfig').innerHTML = '<p class="muted">加载失败</p>';
+    }
+  } catch (e) {
+    document.getElementById('dnsConfig').innerHTML = '<p class="muted">加载失败: ' + e.message + '</p>';
   }
 }
 
