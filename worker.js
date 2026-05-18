@@ -1109,7 +1109,6 @@ function buildAdminHtml() {
       <button class="btn btn-success" id="btn-replace-dns" onclick="openDNSModal()" style="display:none">🔄 一键替换DNS</button>
     </div>
     <div id="domainList" class="domain-list"><p class="muted">加载中...</p></div>
-    <div id="adminDomainResult" style="margin-top:20px"></div>
   </div>
 
   <div class="card">
@@ -1361,24 +1360,31 @@ async function loadDomains() {
   }
 }
 
-function renderDomains(list) {
+function renderDomains(list, speedResults) {
   const el = document.getElementById('domainList');
   if (!list.length) {
     el.innerHTML = '<div class="empty-state"><span class="empty-state-icon">🌐</span><p class="empty-state-text">暂无优选域名</p></div>';
     return;
   }
-  el.innerHTML = list.map(d => {
-    return '<div class="domain-item" data-domain="' + d.domain + '">' +
-      '<div class="domain-info">' +
-        '<div class="domain-name">' + d.name + (d.isBuiltin ? ' <span class="tag tag-builtin">内置</span>' : '') + '</div>' +
-        '<div class="domain-url"><code>' + d.domain + '</code></div>' +
-      '</div>' +
-      '<div class="domain-actions">' +
-        (!d.isBuiltin ? '<button class="btn btn-sm btn-outline" onclick="editDomain(' + d.id + ')">✏️ 编辑</button>' : '') +
-        (!d.isBuiltin ? '<button class="btn btn-sm btn-del" onclick="delDomain(' + d.id + ')">🗑️ 删除</button>' : '') +
-      '</div>' +
-    '</div>';
-  }).join('');
+  const speedMap = {};
+  if (speedResults) speedResults.forEach(r => { speedMap[r.domain] = r; });
+  let html = '<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+  list.forEach(d => {
+    const sr = speedMap[d.domain];
+    const latency = sr && sr.latency >= 0 ? sr.latency + 'ms' : '—';
+    const statusClass = sr ? (sr.latency >= 0 ? (sr.latency < 100 ? 'tag-fast' : sr.latency < 300 ? 'tag-good' : 'tag-slow') : 'tag-timeout') : '';
+    const statusText = sr ? (sr.latency >= 0 ? (sr.latency < 100 ? '极快' : sr.latency < 300 ? '良好' : '较慢') : '超时') : '';
+    const isBest = speedResults && speedResults.length && sr && sr.domain === speedResults.sort((a,b) => (a.latency<0?1:b.latency<0?-1:a.latency-b.latency))[0]?.domain;
+    html += '<tr' + (isBest ? ' class="best"' : '') + '>' +
+      '<td>' + d.name + (d.isBuiltin ? ' <span class="tag tag-builtin">内置</span>' : '') + '</td>' +
+      '<td><code>' + d.domain + '</code></td>' +
+      '<td>' + latency + '</td>' +
+      '<td>' + (statusText ? '<span class="tag ' + statusClass + '">' + statusText + '</span>' : '—') + '</td>' +
+      '<td>' + (!d.isBuiltin ? '<button class="btn btn-sm btn-outline" onclick="editDomain(' + d.id + ')">✏️</button> <button class="btn btn-sm btn-del" onclick="delDomain(' + d.id + ')">🗑️</button>' : '') + '</td>' +
+    '</tr>';
+  });
+  html += '</tbody></table>';
+  el.innerHTML = html;
 }
 
 function openDomainModal() {
@@ -1441,7 +1447,7 @@ async function delDomain(id) {
 }
 
 async function testDomains() {
-  document.getElementById('adminDomainResult').innerHTML = '<p class="muted">测速中...</p>';
+  document.getElementById('domainList').innerHTML = '<p class="muted">测速中...</p>';
   const r = await fetch('/admin/api/speedtest/domains', { method: 'POST' });
   const d = await r.json();
   
@@ -1450,18 +1456,7 @@ async function testDomains() {
     document.getElementById('btn-replace-dns').style.display = 'inline-flex';
   }
   
-  let html = '<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
-  (d.results || []).forEach(x => {
-    const statusText = x.latency >= 0 ? ((x.latency < 100 ? '极快' : x.latency < 300 ? '良好' : '较慢')) : '超时';
-    const statusClass = x.latency >= 0 ? ((x.latency < 100 ? 'tag-fast' : x.latency < 300 ? 'tag-good' : 'tag-slow')) : 'tag-timeout';
-    html += '<tr' + (d.best && d.best.domain === x.domain ? ' class="best"' : '') + '>' +
-      '<td>' + (x.name || '—') + '</td>' +
-      '<td><code>' + x.domain + '</code></td>' +
-      '<td>' + (x.latency >= 0 ? x.latency + 'ms' : '超时') + '</td>' +
-      '<td><span class="tag ' + statusClass + '">' + statusText + '</span></td>' +
-    '</tr>';
-  });
-  document.getElementById('adminDomainResult').innerHTML = html + '</tbody></table>';
+  renderDomains(allDomains, d.results || []);
 }
 
 async function loadDNSConfig() {
