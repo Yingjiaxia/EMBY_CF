@@ -8,9 +8,85 @@ on:
   workflow_dispatch:
 
 jobs:
+  check-secrets:
+    runs-on: ubuntu-latest
+    name: 检查必需变量
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - name: 检查必需 Secrets
+        id: check
+        run: |
+          echo "🔍 检查必需的 GitHub Secrets..."
+          echo ""
+          
+          MISSING=""
+          
+          if [ -z "${{ secrets.CF_API_TOKEN }}" ]; then
+            echo "❌ CF_API_TOKEN - Cloudflare API Token (必需)"
+            MISSING="true"
+          else
+            echo "✅ CF_API_TOKEN"
+          fi
+          
+          if [ -z "${{ secrets.CF_ACCOUNT_ID }}" ]; then
+            echo "❌ CF_ACCOUNT_ID - Cloudflare Account ID (必需)"
+            MISSING="true"
+          else
+            echo "✅ CF_ACCOUNT_ID"
+          fi
+          
+          if [ -z "${{ secrets.ADMIN_TOKEN }}" ]; then
+            echo "❌ ADMIN_TOKEN - 管理后台密钥 (必需)"
+            MISSING="true"
+          else
+            echo "✅ ADMIN_TOKEN"
+          fi
+          
+          if [ -z "${{ secrets.BASE_DOMAIN }}" ]; then
+            echo "❌ BASE_DOMAIN - 你的域名 (必需)"
+            MISSING="true"
+          else
+            echo "✅ BASE_DOMAIN = ${{ secrets.BASE_DOMAIN }}"
+          fi
+          
+          echo ""
+          echo "--- 可选变量 ---"
+          
+          if [ -z "${{ secrets.CF_WORKER_NAME }}" ]; then
+            echo "⚪ CF_WORKER_NAME - Worker名称 (可选，默认: emby-proxy)"
+          else
+            echo "✅ CF_WORKER_NAME = ${{ secrets.CF_WORKER_NAME }}"
+          fi
+          
+          if [ -z "${{ secrets.CF_ZONE_ID }}" ]; then
+            echo "⚪ CF_ZONE_ID - Cloudflare Zone ID (可选，用于DNS一键配置)"
+          else
+            echo "✅ CF_ZONE_ID = ${{ secrets.CF_ZONE_ID }}"
+          fi
+          
+          if [ -z "${{ secrets.DNS_RECORD_NAME }}" ]; then
+            echo "⚪ DNS_RECORD_NAME - DNS记录名称 (可选，默认: emby)"
+          else
+            echo "✅ DNS_RECORD_NAME = ${{ secrets.DNS_RECORD_NAME }}"
+          fi
+          
+          echo ""
+          if [ "$MISSING" = "true" ]; then
+            echo "❌ 缺少必需的变量！请在 GitHub 仓库设置中添加以上标记为 ❌ 的变量。"
+            echo "GitHub → Settings → Secrets and variables → Actions → New repository secret"
+            echo "ready=no" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ 所有必需的变量都已配置！"
+            echo "ready=yes" >> $GITHUB_OUTPUT
+          fi
+
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy
+    name: 部署到 Cloudflare Workers
+    needs: check-secrets
+    if: needs.check-secrets.outputs.ready == 'yes'
     steps:
       - uses: actions/checkout@v4
 
@@ -22,43 +98,59 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler
 
-      - name: Create D1 Database (if not exists)
+      - name: Create D1 Database
         id: create-d1
         run: |
-          echo "Creating D1 database..."
+          echo "📦 正在创建 D1 数据库..."
           RESPONSE=$(wrangler d1 create emby-proxy-db --experimental --no-bundle --api-token="${{ secrets.CF_API_TOKEN }}" --account-id="${{ secrets.CF_ACCOUNT_ID }}" 2>&1 || true)
-          echo "Database creation response: $RESPONSE"
           if echo "$RESPONSE" | grep -q '"uuid"'; then
             DATABASE_ID=$(echo "$RESPONSE" | grep -o '"uuid":"[^"]*"' | cut -d'"' -f4)
-            echo "Database created with ID: $DATABASE_ID"
+            echo "✅ 数据库创建成功，ID: $DATABASE_ID"
             echo "DATABASE_ID=$DATABASE_ID" >> $GITHUB_OUTPUT
           elif echo "$RESPONSE" | grep -q "database already exists"; then
-            echo "Database already exists, fetching existing ID..."
+            echo "🔄 数据库已存在，获取现有ID..."
             LIST_RESPONSE=$(wrangler d1 list --api-token="${{ secrets.CF_API_TOKEN }}" --account-id="${{ secrets.CF_ACCOUNT_ID }}")
             DATABASE_ID=$(echo "$LIST_RESPONSE" | grep "emby-proxy-db" | grep -o '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
-            echo "Existing database ID: $DATABASE_ID"
+            echo "✅ 获取到现有数据库 ID: $DATABASE_ID"
             echo "DATABASE_ID=$DATABASE_ID" >> $GITHUB_OUTPUT
           else
-            echo "Failed to create/find database"
+            echo "⚠️ 数据库操作失败，将使用默认配置"
             echo "DATABASE_ID=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Inject configuration into wrangler.toml
+      - name: 配置 wrangler.toml
         run: |
-          # 设置 Worker 名称（默认使用仓库名）
+          echo "⚙️ 配置 wrangler.toml..."
+          
+          # Worker 名称
           WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
           if [ -z "$WORKER_NAME" ]; then
             WORKER_NAME="emby-proxy"
           fi
           sed -i "s/name = \"fd\"/name = \"$WORKER_NAME\"/g" wrangler.toml
+          echo "   Worker 名称: $WORKER_NAME"
           
-          # 设置 BASE_DOMAIN
+          # BASE_DOMAIN
           sed -i "s|BASE_DOMAIN = \"example.com\"|BASE_DOMAIN = \"${{ secrets.BASE_DOMAIN }}\"|g" wrangler.toml
+          echo "   BASE_DOMAIN: ${{ secrets.BASE_DOMAIN }}"
           
-          # 设置 database_id
-          sed -i "s|database_id = \"5f966506-c2c9-46b0-8f85-9c6ba639c568\"|database_id = \"${{ steps.create-d1.outputs.DATABASE_ID }}\"|g" wrangler.toml
+          # 可选变量
+          if [ -n "${{ secrets.CF_ZONE_ID }}" ]; then
+            sed -i "s|CF_ZONE_ID = \"\"|CF_ZONE_ID = \"${{ secrets.CF_ZONE_ID }}\"|g" wrangler.toml
+            echo "   CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}"
+          fi
+          
+          if [ -n "${{ secrets.DNS_RECORD_NAME }}" ]; then
+            sed -i "s|DNS_RECORD_NAME = \"emby\"|DNS_RECORD_NAME = \"${{ secrets.DNS_RECORD_NAME }}\"|g" wrangler.toml
+            echo "   DNS_RECORD_NAME: ${{ secrets.DNS_RECORD_NAME }}"
+          fi
+          
+          # Database ID
+          if [ -n "${{ steps.create-d1.outputs.DATABASE_ID }}" ]; then
+            sed -i "s|database_id = \"5f966506-c2c9-46b0-8f85-9c6ba639c568\"|database_id = \"${{ steps.create-d1.outputs.DATABASE_ID }}\"|g" wrangler.toml
+          fi
 
-      - name: Deploy to Cloudflare Workers
+      - name: 部署到 Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
