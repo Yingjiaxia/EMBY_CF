@@ -1316,7 +1316,7 @@ function editRoute(prefix) {
 async function saveRoute() {
   const oldPrefix = document.getElementById('oldPrefix').value;
   const remark = document.getElementById('routeRemark').value.trim();
-  const prefix = document.getElementById('routePrefix').value.trim().replace(/^\/+|\/+$/g, '');
+  let prefix = document.getElementById('routePrefix').value.trim(); while(prefix.startsWith('/')) prefix = prefix.slice(1); while(prefix.endsWith('/')) prefix = prefix.slice(0,-1);
   const cache_img = document.getElementById('routeCache').checked ? 'on' : 'off';
   const compat_mode = document.getElementById('routeCompat').checked ? 'on' : 'off';
   const target = document.getElementById('routeTarget').value.trim();
@@ -1407,7 +1407,7 @@ async function saveDomain() {
   if (!name) { showToast('请输入名称'); return; }
   if (!url) { showToast('请输入域名'); return; }
   
-  let domain = url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  let domain = url.replace('https://', '').replace('http://', '').split('/')[0];
   
   let method = 'POST';
   let endpoint = '/admin/api/optimized-domains';
@@ -1566,11 +1566,9 @@ document.getElementById('dnsName').addEventListener('input', function() {
   document.getElementById('dnsPreview').textContent = (this.value.trim() || 'emby') + '.yourdomain.com';
 });
 
-document.addEventListener('DOMContentLoaded', function() {
-  loadRoutes();
-  loadDomains();
-  loadDNSConfig();
-});
+loadRoutes();
+loadDomains();
+loadDNSConfig();
 </script></body></html>`;
 }
 
