@@ -95,7 +95,7 @@ function adminLoginResponse(request, env, tokenFromUser) {
     return json({ ok: false, error: '密钥错误' }, 401);
   }
   const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
-  const cookie = `admin_token=${encodeURIComponent(expected)}; Path=/; Max-Age=2592000; SameSite=Lax${secure}`;
+  const cookie = `admin_token=${encodeURIComponent(expected)}; Path=/; Max-Age=7200; SameSite=Lax${secure}`;
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: {
@@ -1566,9 +1566,11 @@ document.getElementById('dnsName').addEventListener('input', function() {
   document.getElementById('dnsPreview').textContent = (this.value.trim() || 'emby') + '.yourdomain.com';
 });
 
-loadRoutes();
-loadDomains();
-loadDNSConfig();
+document.addEventListener('DOMContentLoaded', function() {
+  loadRoutes();
+  loadDomains();
+  loadDNSConfig();
+});
 </script></body></html>`;
 }
 
