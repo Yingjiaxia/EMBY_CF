@@ -22,11 +22,41 @@ jobs:
       - name: Install Wrangler
         run: npm install -g wrangler
 
-      - name: Inject BASE_DOMAIN into wrangler.toml
-        run: sed -i 's/BASE_DOMAIN = "example.com"/BASE_DOMAIN = "${{ secrets.BASE_DOMAIN }}"/g' wrangler.toml
+      - name: Create D1 Database (if not exists)
+        id: create-d1
+        run: |
+          echo "Creating D1 database..."
+          RESPONSE=$(wrangler d1 create emby-proxy-db --experimental --no-bundle --api-token="${{ secrets.CF_API_TOKEN }}" --account-id="${{ secrets.CF_ACCOUNT_ID }}" 2>&1 || true)
+          echo "Database creation response: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"uuid"'; then
+            DATABASE_ID=$(echo "$RESPONSE" | grep -o '"uuid":"[^"]*"' | cut -d'"' -f4)
+            echo "Database created with ID: $DATABASE_ID"
+            echo "DATABASE_ID=$DATABASE_ID" >> $GITHUB_OUTPUT
+          elif echo "$RESPONSE" | grep -q "database already exists"; then
+            echo "Database already exists, fetching existing ID..."
+            LIST_RESPONSE=$(wrangler d1 list --api-token="${{ secrets.CF_API_TOKEN }}" --account-id="${{ secrets.CF_ACCOUNT_ID }}")
+            DATABASE_ID=$(echo "$LIST_RESPONSE" | grep "emby-proxy-db" | grep -o '"uuid":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "Existing database ID: $DATABASE_ID"
+            echo "DATABASE_ID=$DATABASE_ID" >> $GITHUB_OUTPUT
+          else
+            echo "Failed to create/find database"
+            echo "DATABASE_ID=" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Inject database_id into wrangler.toml
-        run: sed -i 's/database_id = ""/database_id = "${{ secrets.D1_DATABASE_ID }}"/g' wrangler.toml
+      - name: Inject configuration into wrangler.toml
+        run: |
+          # 设置 Worker 名称（默认使用仓库名）
+          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
+          if [ -z "$WORKER_NAME" ]; then
+            WORKER_NAME="emby-proxy"
+          fi
+          sed -i "s/name = \"fd\"/name = \"$WORKER_NAME\"/g" wrangler.toml
+          
+          # 设置 BASE_DOMAIN
+          sed -i "s|BASE_DOMAIN = \"example.com\"|BASE_DOMAIN = \"${{ secrets.BASE_DOMAIN }}\"|g" wrangler.toml
+          
+          # 设置 database_id
+          sed -i "s|database_id = \"5f966506-c2c9-46b0-8f85-9c6ba639c568\"|database_id = \"${{ steps.create-d1.outputs.DATABASE_ID }}\"|g" wrangler.toml
 
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
@@ -35,6 +65,14 @@ jobs:
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
           secrets: |
-            ADMIN_PASSWORD
+            ADMIN_TOKEN
+            CF_API_TOKEN
+            CF_ZONE_ID
+            CF_ACCOUNT_ID
+            DNS_RECORD_NAME
         env:
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          DNS_RECORD_NAME: ${{ secrets.DNS_RECORD_NAME }}

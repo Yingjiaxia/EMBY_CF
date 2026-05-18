@@ -241,6 +241,7 @@ async function cloudflareAPICall(env, method, endpoint, body = null) {
   const apiToken = env.CF_API_TOKEN;
   const zoneId = env.CF_ZONE_ID;
   const accountId = env.CF_ACCOUNT_ID;
+  const dnsRecordName = env.DNS_RECORD_NAME;
   
   if (!apiToken) {
     return { success: false, error: 'CF_API_TOKEN not configured' };
@@ -283,6 +284,7 @@ async function getDNSRecords(env, zoneId) {
 async function createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain) {
   if (!zoneId) zoneId = env.CF_ZONE_ID;
   const baseDomain = env.BASE_DOMAIN || 'example.com';
+  const defaultDNSName = env.DNS_RECORD_NAME || dnsName;
   const fullDNSName = `${dnsName}.${baseDomain}`;
   
   const recordsResult = await getDNSRecords(env, zoneId);
@@ -486,6 +488,14 @@ async function handleAdminApi(request, env, url) {
       return json({ success });
     }
   }
+
+  if (url.pathname === '/api/config/dns-record-name') {
+      return json({ dnsRecordName: env.DNS_RECORD_NAME || 'emby' });
+    }
+    
+    if (url.pathname === '/api/config/base-domain') {
+      return json({ baseDomain: env.BASE_DOMAIN || 'yourdomain.com' });
+    }
 
   if (url.pathname === '/admin/api/dns-config') {
     if (request.method === 'GET') {
@@ -1529,9 +1539,11 @@ async function openDNSModal() {
     zoneSelect.innerHTML = d.zones.map(z => '<option value="' + z.id + '">' + z.name + '</option>').join('');
   }
   
-  document.getElementById('dnsName').value = dnsConfig?.dnsName || 'emby';
+  const dnsNameConfig = await fetch('/api/config/dns-record-name');
+  const dnsNameData = await dnsNameConfig.json();
+  document.getElementById('dnsName').value = dnsConfig?.dnsName || dnsNameData.dnsRecordName || 'emby';
   document.getElementById('dnsTarget').value = bestDomain.domain;
-  document.getElementById('dnsPreview').textContent = (dnsConfig?.dnsName || 'emby') + '.yourdomain.com';
+  document.getElementById('dnsPreview').textContent = (dnsConfig?.dnsName || dnsNameData.dnsRecordName || 'emby') + '.' + (await fetch('/api/config/base-domain')).then(r=>r.json()).then(d=>d.baseDomain || 'yourdomain.com');
   
   openModal('modalDNS');
 }
