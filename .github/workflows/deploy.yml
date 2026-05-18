@@ -175,7 +175,7 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
       - name: 配置 Worker 路由
-        if: ${{ secrets.CF_ZONE_ID != '' }}
+        if: "${{ secrets.CF_ZONE_ID != '' }}"
         run: |
           echo "🌐 配置 Worker 路由..."
           
@@ -210,7 +210,7 @@ jobs:
           fi
 
       - name: 创建 DNS 记录
-        if: ${{ secrets.CF_ZONE_ID != '' }}
+        if: "${{ secrets.CF_ZONE_ID != '' }}"
         run: |
           echo "📝 创建 DNS 记录..."
           
