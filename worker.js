@@ -490,8 +490,19 @@ async function handleAdminApi(request, env, url) {
   if (url.pathname === '/admin/api/dns-config') {
     if (request.method === 'GET') {
       const config = await getDNSConfig(env);
-      const zones = await getZones(env);
-      return json({ success: true, config, zones: zones.result || [] });
+      let zones = [];
+      let zonesError = null;
+      try {
+        const zonesResult = await getZones(env);
+        if (zonesResult.success && zonesResult.result) {
+          zones = zonesResult.result;
+        } else {
+          zonesError = zonesResult.error || zonesResult.errors?.[0]?.message || '获取区域列表失败';
+        }
+      } catch (e) {
+        zonesError = e.message;
+      }
+      return json({ success: true, config, zones, zonesError });
     }
     if (request.method === 'POST') {
       const data = await request.json();
@@ -1468,7 +1479,7 @@ async function loadDNSConfig() {
     const d = await r.json();
     if (d.success) {
       dnsConfig = d.config;
-      renderDNSConfig(d.config, d.zones);
+      renderDNSConfig(d.config, d.zones, d.zonesError);
     } else {
       document.getElementById('dnsConfig').innerHTML = '<p class="muted">加载失败</p>';
     }
@@ -1477,26 +1488,28 @@ async function loadDNSConfig() {
   }
 }
 
-function renderDNSConfig(config, zones) {
+function renderDNSConfig(config, zones, zonesError) {
   const el = document.getElementById('dnsConfig');
   let html = '';
   
+  if (zonesError) {
+    html += '<div class="warn" style="margin-bottom:16px">获取区域列表失败: ' + zonesError + '</div>';
+  }
+  
   if (zones && zones.length) {
-    html = '<div class="form-group"><label>可用区域</label><select id="zoneSelect">';
+    html += '<div class="form-group"><label>可用区域</label><select id="zoneSelect">';
     zones.forEach(z => {
       html += '<option value="' + z.id + '">' + z.name + '</option>';
     });
     html += '</select></div>';
+  } else if (!zonesError) {
+    html += '<p class="muted">未找到可用区域，请确认 CF_API_TOKEN 有 Zone:Read 权限</p>';
   }
   
   if (config) {
     html += '<div class="muted" style="margin-top:16px"><strong>当前配置:</strong> ' +
       (config.dnsName ? config.dnsName : '未设置') + ' → ' +
       (config.currentDomain ? config.currentDomain : '未设置') + '</div>';
-  }
-  
-  if (!html) {
-    html = '<p class="muted">请在环境变量中配置 CF_API_TOKEN</p>';
   }
   
   el.innerHTML = html;
