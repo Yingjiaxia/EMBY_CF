@@ -1,19 +1,19 @@
-const CURRENT_VERSION = '3.2-optimized';
+const CURRENT_VERSION = '3.3-enhanced';
 
-// 优化的优选域名列表 - 移除了子域名前缀
-const OPTIMIZED_DOMAINS = [
-  { domain: 'cf.090227.xyz', name: 'CF优选-090227' },
-  { domain: 'cf.877774.xyz', name: 'CF优选-877774' },
-  { domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选' },
-  { domain: 'saas.sin.fan', name: 'MIYU优选' },
-  { domain: 'bestcf.030101.xyz', name: 'Mingyu优选' },
-  { domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选' },
-  { domain: 'cf.tencentapp.cn', name: '腾讯泛域名' },
-  { domain: 'www.visa.cn', name: 'Visa官方' },
-  { domain: 'mfa.gov.ua', name: '乌克兰外交部' },
-  { domain: 'www.shopify.com', name: 'Shopify官方' },
-  { domain: 'store.ubi.com', name: '育碧商店' },
-  { domain: 'staticdelivery.nexusmods.com', name: 'NexusMods' },
+// 内置优选域名
+const DEFAULT_OPTIMIZED_DOMAINS = [
+  { domain: 'cf.090227.xyz', name: 'CF优选-090227', isBuiltin: true },
+  { domain: 'cf.877774.xyz', name: 'CF优选-877774', isBuiltin: true },
+  { domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选', isBuiltin: true },
+  { domain: 'saas.sin.fan', name: 'MIYU优选', isBuiltin: true },
+  { domain: 'bestcf.030101.xyz', name: 'Mingyu优选', isBuiltin: true },
+  { domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选', isBuiltin: true },
+  { domain: 'cf.tencentapp.cn', name: '腾讯泛域名', isBuiltin: true },
+  { domain: 'www.visa.cn', name: 'Visa官方', isBuiltin: true },
+  { domain: 'mfa.gov.ua', name: '乌克兰外交部', isBuiltin: true },
+  { domain: 'www.shopify.com', name: 'Shopify官方', isBuiltin: true },
+  { domain: 'store.ubi.com', name: '育碧商店', isBuiltin: true },
+  { domain: 'staticdelivery.nexusmods.com', name: 'NexusMods', isBuiltin: true },
 ];
 
 const RESERVED_ALIASES = new Set([
@@ -141,8 +141,175 @@ async function initDatabase(env) {
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS auto_emby_daily_stats (
       date TEXT PRIMARY KEY, playing_count INTEGER DEFAULT 0, playback_info_count INTEGER DEFAULT 0
     )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS optimized_domains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      domain TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      is_builtin INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS dns_config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dns_name TEXT NOT NULL,
+      current_domain TEXT,
+      zone_id TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`),
   ]);
+  
+  try {
+    const { results } = await env.DB.prepare('SELECT COUNT(*) as count FROM optimized_domains').all();
+    if (results[0].count === 0) {
+      const stmt = env.DB.prepare('INSERT INTO optimized_domains (domain, name, is_builtin) VALUES (?, ?, 1)');
+      for (const d of DEFAULT_OPTIMIZED_DOMAINS) {
+        try {
+          await stmt.bind(d.domain, d.name).run();
+        } catch (e) {}
+      }
+    }
+  } catch (e) {}
+  
   dbReady = true;
+}
+
+async function getOptimizedDomains(env) {
+  const { results } = await env.DB.prepare('SELECT * FROM optimized_domains ORDER BY is_builtin DESC, name ASC').all();
+  return results.map(r => ({
+    id: r.id,
+    domain: r.domain,
+    name: r.name,
+    isBuiltin: Boolean(r.is_builtin),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
+}
+
+async function addOptimizedDomain(env, domain, name) {
+  const result = await env.DB.prepare('INSERT INTO optimized_domains (domain, name, is_builtin) VALUES (?, ?, 0)')
+    .bind(domain, name)
+    .run();
+  return result.success;
+}
+
+async function updateOptimizedDomain(env, id, domain, name) {
+  const result = await env.DB.prepare('UPDATE optimized_domains SET domain = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .bind(domain, name, id)
+    .run();
+  return result.success;
+}
+
+async function deleteOptimizedDomain(env, id) {
+  const result = await env.DB.prepare('DELETE FROM optimized_domains WHERE id = ?')
+    .bind(id)
+    .run();
+  return result.success;
+}
+
+async function getDNSConfig(env) {
+  const { results } = await env.DB.prepare('SELECT * FROM dns_config ORDER BY id DESC LIMIT 1').all();
+  if (results.length > 0) {
+    return {
+      id: results[0].id,
+      dnsName: results[0].dns_name,
+      currentDomain: results[0].current_domain,
+      zoneId: results[0].zone_id,
+      createdAt: results[0].created_at,
+      updatedAt: results[0].updated_at,
+    };
+  }
+  return null;
+}
+
+async function saveDNSConfig(env, dnsName, currentDomain, zoneId) {
+  const existing = await getDNSConfig(env);
+  let result;
+  if (existing) {
+    result = await env.DB.prepare('UPDATE dns_config SET dns_name = ?, current_domain = ?, zone_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .bind(dnsName, currentDomain || '', zoneId || '', existing.id)
+      .run();
+  } else {
+    result = await env.DB.prepare('INSERT INTO dns_config (dns_name, current_domain, zone_id) VALUES (?, ?, ?)')
+      .bind(dnsName, currentDomain || '', zoneId || '')
+      .run();
+  }
+  return result.success;
+}
+
+async function cloudflareAPICall(env, method, endpoint, body = null) {
+  const apiKey = env.CLOUDFLARE_API_KEY;
+  const email = env.CLOUDFLARE_EMAIL;
+  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  
+  if (!apiKey || !email) {
+    return { success: false, error: 'Cloudflare API credentials not configured' };
+  }
+  
+  const url = `https://api.cloudflare.com/client/v4${endpoint}`;
+  const headers = {
+    'X-Auth-Email': email,
+    'X-Auth-Key': apiKey,
+    'Content-Type': 'application/json',
+  };
+  
+  const options = {
+    method,
+    headers,
+  };
+  
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+  
+  try {
+    const response = await fetch(url, options);
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function getZones(env) {
+  return await cloudflareAPICall(env, 'GET', '/zones');
+}
+
+async function getDNSRecords(env, zoneId) {
+  return await cloudflareAPICall(env, 'GET', `/zones/${zoneId}/dns_records`);
+}
+
+async function createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain) {
+  const baseDomain = env.BASE_DOMAIN || 'example.com';
+  const fullDNSName = `${dnsName}.${baseDomain}`;
+  
+  const recordsResult = await getDNSRecords(env, zoneId);
+  if (!recordsResult.success) {
+    return recordsResult;
+  }
+  
+  const existingRecord = recordsResult.result.find(r => r.name === fullDNSName && r.type === 'CNAME');
+  
+  const recordData = {
+    type: 'CNAME',
+    name: dnsName,
+    content: targetDomain,
+    ttl: 1,
+    proxied: true,
+  };
+  
+  let result;
+  if (existingRecord) {
+    result = await cloudflareAPICall(env, 'PUT', `/zones/${zoneId}/dns_records/${existingRecord.id}`, recordData);
+  } else {
+    result = await cloudflareAPICall(env, 'POST', `/zones/${zoneId}/dns_records`, recordData);
+  }
+  
+  if (result.success) {
+    await saveDNSConfig(env, dnsName, targetDomain, zoneId);
+  }
+  
+  return result;
 }
 
 async function getEdgeInfo(request) {
@@ -183,14 +350,20 @@ async function speedtestUrl(urlStr, timeoutMs = 5000) {
   }
 }
 
-async function speedtestOptimizedFromEdge() {
+async function speedtestOptimizedFromEdge(env) {
+  const domains = await getOptimizedDomains(env);
   const results = [];
-  for (const item of OPTIMIZED_DOMAINS) {
+  for (const item of domains) {
     const host = item.domain;
     const ms = await speedtestUrl(`https://${host}/cdn-cgi/trace`, 4000);
     results.push({
-      domain: item.domain, name: item.name, host,
-      latency: ms, status: latencyStatus(ms),
+      id: item.id,
+      domain: item.domain,
+      name: item.name,
+      host,
+      latency: ms,
+      status: latencyStatus(ms),
+      isBuiltin: item.isBuiltin,
     });
   }
   results.sort((a, b) => {
@@ -200,7 +373,7 @@ async function speedtestOptimizedFromEdge() {
     return a.latency - b.latency;
   });
   const best = results.find((r) => r.latency >= 0);
-  return { results, best: best ? best.host : null };
+  return { results, best: best ? best : null };
 }
 
 async function recordStats(env, type) {
@@ -215,7 +388,7 @@ async function recordStats(env, type) {
 }
 
 async function handleStatsRequest(env) {
-  if (!env.DB) return json({ error: "D1 数据库未绑定", data: null });
+  if (!env.DB) return json({ error: 'D1 数据库未绑定', data: null });
   const statsResult = await env.DB.prepare(
     `SELECT date, playing_count, playback_info_count FROM auto_emby_daily_stats
      WHERE date >= date('now', '-30 days') ORDER BY date DESC`
@@ -283,8 +456,58 @@ async function handleAdminApi(request, env, url) {
   }
 
   if (url.pathname === '/admin/api/speedtest/domains' && request.method === 'POST') {
-    const data = await speedtestOptimizedFromEdge();
+    const data = await speedtestOptimizedFromEdge(env);
     return json(data);
+  }
+
+  if (url.pathname === '/admin/api/optimized-domains') {
+    if (request.method === 'GET') {
+      const domains = await getOptimizedDomains(env);
+      return json({ success: true, domains });
+    }
+    if (request.method === 'POST') {
+      const data = await request.json();
+      const success = await addOptimizedDomain(env, data.domain, data.name);
+      return json({ success });
+    }
+  }
+
+  if (url.pathname.startsWith('/admin/api/optimized-domains/')) {
+    const id = url.pathname.split('/').pop();
+    if (request.method === 'PUT') {
+      const data = await request.json();
+      const success = await updateOptimizedDomain(env, id, data.domain, data.name);
+      return json({ success });
+    }
+    if (request.method === 'DELETE') {
+      const success = await deleteOptimizedDomain(env, id);
+      return json({ success });
+    }
+  }
+
+  if (url.pathname === '/admin/api/dns-config') {
+    if (request.method === 'GET') {
+      const config = await getDNSConfig(env);
+      const zones = await getZones(env);
+      return json({ success: true, config, zones: zones.result || [] });
+    }
+    if (request.method === 'POST') {
+      const data = await request.json();
+      const success = await saveDNSConfig(env, data.dnsName, data.currentDomain || '', data.zoneId || '');
+      return json({ success });
+    }
+  }
+
+  if (url.pathname === '/admin/api/dns/replace' && request.method === 'POST') {
+    const data = await request.json();
+    const { zoneId, dnsName, targetDomain } = data;
+    
+    if (!zoneId || !dnsName || !targetDomain) {
+      return json({ success: false, error: '缺少必要参数' });
+    }
+    
+    const result = await createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain);
+    return json(result);
   }
 
   return json({ error: 'Not found' }, 404);
@@ -569,6 +792,7 @@ const PAGE_STYLE = `
   .tag-good { background: rgba(96, 165, 250, 0.2); color: #93c5fd; border: 1px solid rgba(96, 165, 250, 0.3); }
   .tag-slow { background: rgba(251, 191, 36, 0.2); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.3); }
   .tag-timeout { background: rgba(248, 113, 113, 0.2); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3); }
+  .tag-builtin { background: rgba(168, 85, 247, 0.2); color: #a855f7; border: 1px solid rgba(168, 85, 247, 0.3); }
   .edge-box { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
   .edge-item { background: rgba(15, 23, 42, 0.5); padding: 16px; border-radius: 12px; font-size: 13px; border: 1px solid rgba(148, 163, 184, 0.1); }
   .edge-item strong { color: #60a5fa; display: block; margin-bottom: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -576,6 +800,13 @@ const PAGE_STYLE = `
   .btn:hover { background: linear-gradient(135deg, #93c5fd 0%, #60a5fa 100%); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(96, 165, 250, 0.4); }
   .btn:active { transform: translateY(0); }
   .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+  .btn-success { background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%); }
+  .btn-success:hover { background: linear-gradient(135deg, #4ade80 0%, #22c55e 100%); }
+  .btn-sm { padding: 8px 14px; font-size: 13px; border-radius: 10px; font-weight: 500; }
+  .btn-del { background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; box-shadow: none; }
+  .btn-del:hover { background: rgba(248, 113, 113, 0.25); }
+  .btn-outline { background: rgba(148, 163, 184, 0.15); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; box-shadow: none; }
+  .btn-outline:hover { background: rgba(148, 163, 184, 0.25); }
   .warn { border: 2px solid rgba(248, 113, 113, 0.3); padding: 20px; border-radius: 16px; color: #fca5a5; background: rgba(248, 113, 113, 0.08); }
   input[type=password], input[type=text], input[type=url], select { width: 100%; padding: 14px 16px; border: 2px solid rgba(148, 163, 184, 0.2); border-radius: 12px; background: rgba(15, 23, 42, 0.6); color: #e5e7eb; margin-bottom: 16px; font-size: 14px; transition: all 0.2s ease; }
   input[type=password]:focus, input[type=text]:focus, input[type=url]:focus, select:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.1); }
@@ -592,11 +823,6 @@ const PAGE_STYLE = `
   .route-name { font-size: 1.3em; font-weight: 700; color: #f1f5f9; margin: 0 0 4px; letter-spacing: -0.01em; }
   .route-path { color: #60a5fa; font-weight: 600; font-size: 0.95em; }
   .route-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(148, 163, 184, 0.1); }
-  .btn-sm { padding: 8px 14px; font-size: 13px; border-radius: 10px; font-weight: 500; }
-  .btn-del { background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; box-shadow: none; }
-  .btn-del:hover { background: rgba(248, 113, 113, 0.25); }
-  .btn-outline { background: rgba(148, 163, 184, 0.15); border: 1px solid rgba(148, 163, 184, 0.3); color: #cbd5e1; box-shadow: none; }
-  .btn-outline:hover { background: rgba(148, 163, 184, 0.25); }
   .target-list { margin-top: 12px; }
   .target-row { background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(148, 163, 184, 0.1); border-radius: 12px; padding: 12px 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 12px; transition: all 0.2s ease; }
   .target-row:hover { background: rgba(15, 23, 42, 0.8); border-color: rgba(148, 163, 184, 0.2); }
@@ -628,10 +854,15 @@ const PAGE_STYLE = `
   .checkbox-label input[type="checkbox"] { width: 18px !important; height: 18px; accent-color: #60a5fa; cursor: pointer; flex-shrink: 0; }
   #toast { position: fixed; top: -60px; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); color: #f1f5f9; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 500; transition: top 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; border: 1px solid rgba(96, 165, 250, 0.3); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }
   #toast.show { top: 20px; }
+  .domain-list { margin-top: 16px; }
+  .domain-item { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: rgba(15, 23, 42, 0.6); border-radius: 12px; margin-bottom: 8px; border: 1px solid rgba(148, 163, 184, 0.1); }
+  .domain-info { flex: 1; }
+  .domain-name { font-weight: 600; color: #f1f5f9; }
+  .domain-url { color: #94a3b8; font-size: 13px; }
+  .domain-actions { display: flex; gap: 8px; }
 `;
 
 function buildFrontendHtml() {
-  const domainListJson = JSON.stringify(OPTIMIZED_DOMAINS);
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Emby 反代 | 自动测速优选</title><style>${PAGE_STYLE}</style></head><body>
 <div class="container">
@@ -648,7 +879,10 @@ function buildFrontendHtml() {
   <div class="card">
     <h2>优选域名测速（本地网络到优选域名）</h2>
     <p class="muted">测试您本地网络到各优选域名的真实延迟，自动排序显示最快节点</p>
-    <div class="toolbar"><button class="btn" id="btn-retest">重新测速</button><span id="speed-status" class="muted"></span></div>
+    <div class="toolbar">
+      <button class="btn" id="btn-retest">重新测速</button>
+      <span id="speed-status" class="muted"></span>
+    </div>
     <div id="domain-table-wrap"><p class="muted" id="domain-loading">正在测速...</p></div>
   </div>
   <div class="card">
@@ -669,7 +903,6 @@ function buildFrontendHtml() {
   </div>
 </div>
 <script>
-const OPT_DOMAINS = ${domainListJson};
 const TAG = { fast:'极快', good:'良好', slow:'较慢', timeout:'超时' };
 const CLS = { fast:'tag-fast', good:'tag-good', slow:'tag-slow', timeout:'tag-timeout' };
 
@@ -696,7 +929,7 @@ function renderDomainTable(results, best) {
   let html = '<table><thead><tr><th>#</th><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
   results.forEach((r, i) => {
     const host = r.host || r.domain;
-    const isBest = best && best === host;
+    const isBest = best && best.domain === r.domain;
     html += '<tr class="'+(isBest?'best':'')+'"><td>'+(i+1)+'</td><td>'+ (r.name||'—') +'</td><td><code>'+host+'</code></td><td>'+(r.latency>=0?r.latency+' ms':'—')+'</td><td><span class="tag '+CLS[r.status||'timeout']+'">'+(TAG[r.status]||'—')+'</span></td></tr>';
   });
   wrap.innerHTML = html + '</tbody></table>';
@@ -728,7 +961,7 @@ async function probeDomain(item) {
     const ms = await pingMs('https://' + host + p, 7000);
     if (ms >= 0) {
       const status = ms < 100 ? 'fast' : ms < 300 ? 'good' : 'slow';
-      return { domain: item.domain, name: item.name, host, latency: ms, status, source: 'client' };
+      return { id: item.id, domain: item.domain, name: item.name, host, latency: ms, status, isBuiltin: item.isBuiltin };
     }
   }
   try {
@@ -736,16 +969,25 @@ async function probeDomain(item) {
     const d = await r.json();
     if (d.ms >= 0) {
       const status = d.ms < 100 ? 'fast' : d.ms < 300 ? 'good' : 'slow';
-      return { domain: item.domain, name: item.name, host, latency: d.ms, status, source: 'edge' };
+      return { id: item.id, domain: item.domain, name: item.name, host, latency: d.ms, status, isBuiltin: item.isBuiltin };
     }
   } catch (_) {}
-  return { domain: item.domain, name: item.name, host, latency: -1, status: 'timeout', source: 'none' };
+  return { id: item.id, domain: item.domain, name: item.name, host, latency: -1, status: 'timeout', isBuiltin: item.isBuiltin };
 }
 
 function finalizeResults(rows) {
   rows.forEach(r => { if (r.latency >= 0) r.status = r.latency < 100 ? 'fast' : r.latency < 300 ? 'good' : 'slow'; else r.status = 'timeout'; });
   rows.sort((a,b) => { if (a.latency<0) return 1; if (b.latency<0) return -1; return a.latency-b.latency; });
   return rows;
+}
+
+async function getOptimizedDomains() {
+  try {
+    const r = await fetch('/admin/api/optimized-domains');
+    const d = await r.json();
+    if (d.success) return d.domains;
+  } catch (_) {}
+  return [];
 }
 
 async function runDomainSpeed(force) {
@@ -755,7 +997,7 @@ async function runDomainSpeed(force) {
   wrap.innerHTML = '<p class="muted">正在测试您本地网络到各优选域名的延迟...</p>';
   
   try {
-    const er = await fetch('/api/domains/speed?edge=1');
+    const er = await fetch('/admin/api/speedtest/domains', { method: 'POST' });
     const ed = await er.json();
     if (ed.results?.length) {
       renderDomainTable(ed.results, ed.best);
@@ -763,14 +1005,15 @@ async function runDomainSpeed(force) {
     }
   } catch (_) {}
   
-  const clientResults = await Promise.all(OPT_DOMAINS.map(probeDomain));
+  const domains = await getOptimizedDomains();
+  const clientResults = await Promise.all(domains.map(probeDomain));
   finalizeResults(clientResults);
   const clientOk = clientResults.filter(r => r.latency >= 0).length;
   const best = clientResults.find(r => r.latency >= 0);
-  renderDomainTable(clientResults, best ? best.host : null);
+  renderDomainTable(clientResults, best);
   
   if (clientOk > 0) {
-    st.textContent = '测速完成！' + clientOk + ' 个域名可用，推荐使用: ' + (best ? best.host : '无');
+    st.textContent = '测速完成！' + clientOk + ' 个域名可用，推荐使用: ' + (best ? best.domain : '无');
   } else {
     st.textContent = '测速失败，请检查网络或稍后重试';
   }
@@ -859,10 +1102,21 @@ function buildAdminHtml() {
   </div>
 
   <div class="card">
-    <h2>⚡ 优选域名测速（边缘节点到优选域名）</h2>
-    <p class="muted" style="margin-bottom:16px">测试 Cloudflare 边缘节点到优选入口的延迟</p>
-    <button class="btn" onclick="testDomains()">🚀 开始测速</button>
+    <h2>⚡ 优选域名管理</h2>
+    <div class="toolbar" style="margin-bottom:16px">
+      <button class="btn" onclick="openDomainModal()">➕ 添加优选域名</button>
+      <button class="btn" onclick="testDomains()">🚀 开始测速</button>
+      <button class="btn btn-success" id="btn-replace-dns" onclick="openDNSModal()" style="display:none">🔄 一键替换DNS</button>
+    </div>
+    <div id="domainList" class="domain-list"><p class="muted">加载中...</p></div>
     <div id="adminDomainResult" style="margin-top:20px"></div>
+  </div>
+
+  <div class="card">
+    <h2>🔧 DNS 配置</h2>
+    <div id="dnsConfig">
+      <p class="muted">加载中...</p>
+    </div>
   </div>
 </div>
 
@@ -903,155 +1157,402 @@ function buildAdminHtml() {
   </div>
 </div>
 
+<div id="modalDomain" class="modal">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h2 class="modal-title" id="domainModalTitle">➕ 添加优选域名</h2>
+      <p class="modal-desc">添加您自己的优选域名</p>
+    </div>
+    <input type="hidden" id="domainId">
+    <div class="form-group">
+      <label>名称</label>
+      <input id="domainName" placeholder="例如：我的优选域名">
+    </div>
+    <div class="form-group">
+      <label>域名</label>
+      <input id="domainUrl" type="url" placeholder="https://example.com">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('modalDomain')">取消</button>
+      <button class="btn" onclick="saveDomain()">💾 保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="modalDNS" class="modal">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h2 class="modal-title">🔄 一键替换 DNS</h2>
+      <p class="modal-desc">将最优域名配置到您的 DNS 记录</p>
+    </div>
+    <div class="form-group">
+      <label>选择区域 (Zone)</label>
+      <select id="dnsZone">
+        <option value="">加载中...</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>DNS 名称</label>
+      <input id="dnsName" placeholder="例如：emby">
+      <p class="form-hint">将创建 <span id="dnsPreview">emby.yourdomain.com</span></p>
+    </div>
+    <div class="form-group">
+      <label>目标域名</label>
+      <input id="dnsTarget" placeholder="最优域名">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal('modalDNS')">取消</button>
+      <button class="btn btn-success" onclick="replaceDNS()">🚀 替换</button>
+    </div>
+  </div>
+</div>
+
 <script>
-let allRoutes=[];
+let allRoutes = [];
+let allDomains = [];
+let bestDomain = null;
+let dnsConfig = null;
 
-function closeModal(id){document.getElementById(id).classList.remove('show');}
-function openModal(id){document.getElementById(id).classList.add('show');}
-
-function logout(){document.cookie='admin_token=;path=/;max-age=0';location.reload();}
-
-function showToast(msg){
-  var t=document.getElementById('toast');
-  if(!t){t=document.createElement('div');t.id='toast';document.body.appendChild(t);}
-  t.textContent=msg;t.classList.add('show');
-  setTimeout(function(){t.classList.remove('show');},2500);
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function() { t.classList.remove('show'); }, 2500);
 }
 
-async function loadRoutes(){
-  const r=await fetch('/admin/api/routes');
-  if(r.status===401){location.reload();return;}
-  allRoutes=await r.json();
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+
+function logout() { document.cookie = 'admin_token=;path=/;max-age=0'; location.reload(); }
+
+async function loadRoutes() {
+  const r = await fetch('/admin/api/routes');
+  if (r.status === 401) { location.reload(); return; }
+  allRoutes = await r.json();
   renderRoutes(allRoutes);
 }
 
-function renderRoutes(list){
-  const el=document.getElementById('routeList');
-  if(!list.length){
-    el.innerHTML='<div class="empty-state" style="grid-column:1/-1"><span class="empty-state-icon">📦</span><p class="empty-state-text">暂无路由，点击上方按钮添加</p></div>';
+function renderRoutes(list) {
+  const el = document.getElementById('routeList');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><span class="empty-state-icon">📦</span><p class="empty-state-text">暂无路由，点击上方按钮添加</p></div>';
     return;
   }
-  el.innerHTML=list.map(r=>{
-    const targets=r.target.split(',').map(s=>s.trim()).filter(Boolean);
-    const remarkName=r.remark||'未命名';
-    const cacheStatus=r.cache_img!=='off';
-    const compatStatus=r.compat_mode==='on';
+  el.innerHTML = list.map(r => {
+    const targets = r.target.split(',').map(s => s.trim()).filter(Boolean);
+    const remarkName = r.remark || '未命名';
+    const cacheStatus = r.cache_img !== 'off';
+    const compatStatus = r.compat_mode === 'on';
 
-    let targetsHtml='';
-    targets.forEach((t,idx)=>{
-      const tag=idx===0?'<span style="color:#4ade80;font-weight:bold;">[主]</span>':'<span style="color:#fbbf24;font-weight:bold;">[备'+idx+']</span>';
-      targetsHtml+='<div class="target-row">'+tag+' <span class="target-url"><code>'+t+'</code></span></div>';
+    let targetsHtml = '';
+    targets.forEach((t, idx) => {
+      const tag = idx === 0 ? '<span style="color:#4ade80;font-weight:bold">[主]</span>' : '<span style="color:#fbbf24;font-weight:bold">[备' + idx + ']</span>';
+      targetsHtml += '<div class="target-row">' + tag + ' <span class="target-url"><code>' + t + '</code></span></div>';
     });
 
-    return '<div class="route-item" data-search="'+(remarkName+' '+r.prefix).toLowerCase()+'">'+
-      '<div class="route-header">'+
-        '<div class="route-title">'+
-          '<h3 class="route-name">'+remarkName+'</h3>'+
-          '<span class="route-path">/'+r.prefix+'</span>'+
-        '</div>'+
-      '</div>'+
-      '<div class="target-list">'+targetsHtml+'</div>'+
-      '<div class="route-meta">'+
-        (cacheStatus?'<span class="meta-tag">🖼️ 缓存开启</span>':'<span class="meta-tag">缓存关闭</span>')+
-        (compatStatus?'<span class="meta-tag" style="background:rgba(251,191,36,0.2);color:#fbbf24">🔧 兼容模式</span>':'')+
-        (r.last_play?'<span class="meta-tag">📺 '+r.last_play+'</span>':'')+
-      '</div>'+
-      '<div class="route-actions">'+
-        '<button class="btn btn-sm btn-outline" onclick="editRoute(\\''+r.prefix+'\\')">✏️ 编辑</button>'+
-        '<button class="btn btn-sm btn-del" onclick="delRoute(\\''+r.prefix+'\\')">🗑️ 删除</button>'+
-      '</div>'+
+    return '<div class="route-item" data-search="' + (remarkName + ' ' + r.prefix).toLowerCase() + '">' +
+      '<div class="route-header">' +
+        '<div class="route-title">' +
+          '<h3 class="route-name">' + remarkName + '</h3>' +
+          '<span class="route-path">/' + r.prefix + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="target-list">' + targetsHtml + '</div>' +
+      '<div class="route-meta">' +
+        (cacheStatus ? '<span class="meta-tag">🖼️ 缓存开启</span>' : '<span class="meta-tag">缓存关闭</span>') +
+        (compatStatus ? '<span class="meta-tag" style="background:rgba(251,191,36,0.2);color:#fbbf24">🔧 兼容模式</span>' : '') +
+        (r.last_play ? '<span class="meta-tag">📺 ' + r.last_play + '</span>' : '') +
+      '</div>' +
+      '<div class="route-actions">' +
+        '<button class="btn btn-sm btn-outline" onclick="editRoute(\\'' + r.prefix + '\\')">✏️ 编辑</button>' +
+        '<button class="btn btn-sm btn-del" onclick="delRoute(\\'' + r.prefix + '\\')">🗑️ 删除</button>' +
+      '</div>' +
     '</div>';
   }).join('');
 }
 
-function filterRoutes(){
-  const q=document.getElementById('routeSearch').value.toLowerCase();
-  document.querySelectorAll('.route-item').forEach(c=>{
-    c.style.display=(!q||c.dataset.search.includes(q))?'block':'none';
+function filterRoutes() {
+  const q = document.getElementById('routeSearch').value.toLowerCase();
+  document.querySelectorAll('.route-item').forEach(c => {
+    c.style.display = (!q || c.dataset.search.includes(q)) ? 'block' : 'none';
   });
 }
 
-function openRouteModal(){
-  document.getElementById('oldPrefix').value='';
-  document.getElementById('routeRemark').value='';
-  document.getElementById('routePrefix').value='';
-  document.getElementById('routeTarget').value='';
-  document.getElementById('routeCache').checked=true;
-  document.getElementById('routeCompat').checked=false;
-  document.getElementById('prefixPreview').textContent='myemby';
-  document.getElementById('routeModalTitle').textContent='➕ 添加路由';
+function openRouteModal() {
+  document.getElementById('oldPrefix').value = '';
+  document.getElementById('routeRemark').value = '';
+  document.getElementById('routePrefix').value = '';
+  document.getElementById('routeTarget').value = '';
+  document.getElementById('routeCache').checked = true;
+  document.getElementById('routeCompat').checked = false;
+  document.getElementById('prefixPreview').textContent = 'myemby';
+  document.getElementById('routeModalTitle').textContent = '➕ 添加路由';
   openModal('modalRoute');
 }
 
-function editRoute(prefix){
-  const r=allRoutes.find(x=>x.prefix===prefix);
-  if(!r)return;
-  document.getElementById('oldPrefix').value=r.prefix;
-  document.getElementById('routeRemark').value=r.remark||'';
-  document.getElementById('routePrefix').value=r.prefix;
-  document.getElementById('routeTarget').value=r.target;
-  document.getElementById('routeCache').checked=r.cache_img!=='off';
-  document.getElementById('routeCompat').checked=r.compat_mode==='on';
-  document.getElementById('prefixPreview').textContent=r.prefix;
-  document.getElementById('routeModalTitle').textContent='✏️ 编辑路由';
+function editRoute(prefix) {
+  const r = allRoutes.find(x => x.prefix === prefix);
+  if (!r) return;
+  document.getElementById('oldPrefix').value = r.prefix;
+  document.getElementById('routeRemark').value = r.remark || '';
+  document.getElementById('routePrefix').value = r.prefix;
+  document.getElementById('routeTarget').value = r.target;
+  document.getElementById('routeCache').checked = r.cache_img !== 'off';
+  document.getElementById('routeCompat').checked = r.compat_mode === 'on';
+  document.getElementById('prefixPreview').textContent = r.prefix;
+  document.getElementById('routeModalTitle').textContent = '✏️ 编辑路由';
   openModal('modalRoute');
 }
 
-async function saveRoute(){
-  const oldPrefix=document.getElementById('oldPrefix').value;
-  const remark=document.getElementById('routeRemark').value.trim();
-  const prefix=document.getElementById('routePrefix').value.trim().replace(/^\/+|\/+$/g,'');
-  const cache_img=document.getElementById('routeCache').checked?'on':'off';
-  const compat_mode=document.getElementById('routeCompat').checked?'on':'off';
-  const target=document.getElementById('routeTarget').value.trim();
+async function saveRoute() {
+  const oldPrefix = document.getElementById('oldPrefix').value;
+  const remark = document.getElementById('routeRemark').value.trim();
+  const prefix = document.getElementById('routePrefix').value.trim().replace(/^\\/+|\\/+$/g, '');
+  const cache_img = document.getElementById('routeCache').checked ? 'on' : 'off';
+  const compat_mode = document.getElementById('routeCompat').checked ? 'on' : 'off';
+  const target = document.getElementById('routeTarget').value.trim();
 
-  if(!prefix){showToast('请输入路径');return;}
-  if(!target){showToast('请至少填写一个目标地址');return;}
+  if (!prefix) { showToast('请输入路径'); return; }
+  if (!target) { showToast('请至少填写一个目标地址'); return; }
 
-  document.getElementById('prefixPreview').textContent=prefix||'myemby';
+  document.getElementById('prefixPreview').textContent = prefix || 'myemby';
 
-  const r=await fetch('/admin/api/routes',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({oldPrefix,prefix,target,remark,cache_img,compat_mode})
+  const r = await fetch('/admin/api/routes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ oldPrefix, prefix, target, remark, cache_img, compat_mode })
   });
-  const d=await r.json();
-  if(!r.ok){showToast(d.error||'保存失败');return;}
+  const d = await r.json();
+  if (!r.ok) { showToast(d.error || '保存失败'); return; }
   closeModal('modalRoute');
   showToast('保存成功');
   loadRoutes();
 }
 
-async function delRoute(prefix){
-  if(!confirm('确定删除路由 /'+prefix+' ？'))return;
-  await fetch('/admin/api/routes?prefix='+encodeURIComponent(prefix),{method:'DELETE'});
+async function delRoute(prefix) {
+  if (!confirm('确定删除路由 /' + prefix + ' ？')) return;
+  await fetch('/admin/api/routes?prefix=' + encodeURIComponent(prefix), { method: 'DELETE' });
   showToast('已删除');
   loadRoutes();
 }
 
-async function testDomains(){
-  document.getElementById('adminDomainResult').innerHTML='<p class="muted">测速中...</p>';
-  const r=await fetch('/admin/api/speedtest/domains',{method:'POST'});
-  const d=await r.json();
-  let h='<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
-  (d.results||[]).forEach(x=>{
-    const statusText=x.latency>=0?((x.latency<100?'极快':x.latency<300?'良好':'较慢')):'超时';
-    const statusClass=x.latency>=0?((x.latency<100?'tag-fast':x.latency<300?'tag-good':'tag-slow')):'tag-timeout';
-    h+='<tr'+(d.best===x.domain?' class="best"':'')+'>'+
-      '<td>'+(x.name||'—')+'</td>'+
-      '<td><code>'+x.domain+'</code></td>'+
-      '<td>'+(x.latency>=0?x.latency+'ms':'超时')+'</td>'+
-      '<td><span class="tag '+statusClass+'">'+statusText+'</span></td>'+
-    '</tr>';
-  });
-  document.getElementById('adminDomainResult').innerHTML=h+'</tbody></table>';
+async function loadDomains() {
+  const r = await fetch('/admin/api/optimized-domains');
+  if (r.status === 401) { location.reload(); return; }
+  const d = await r.json();
+  if (d.success) {
+    allDomains = d.domains;
+    renderDomains(allDomains);
+  }
 }
 
-document.getElementById('routePrefix').addEventListener('input',function(){
-  document.getElementById('prefixPreview').textContent=this.value.trim()||'myemby';
+function renderDomains(list) {
+  const el = document.getElementById('domainList');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty-state"><span class="empty-state-icon">🌐</span><p class="empty-state-text">暂无优选域名</p></div>';
+    return;
+  }
+  el.innerHTML = list.map(d => {
+    return '<div class="domain-item" data-domain="' + d.domain + '">' +
+      '<div class="domain-info">' +
+        '<div class="domain-name">' + d.name + (d.isBuiltin ? ' <span class="tag tag-builtin">内置</span>' : '') + '</div>' +
+        '<div class="domain-url"><code>' + d.domain + '</code></div>' +
+      '</div>' +
+      '<div class="domain-actions">' +
+        (!d.isBuiltin ? '<button class="btn btn-sm btn-outline" onclick="editDomain(' + d.id + ')">✏️ 编辑</button>' : '') +
+        (!d.isBuiltin ? '<button class="btn btn-sm btn-del" onclick="delDomain(' + d.id + ')">🗑️ 删除</button>' : '') +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function openDomainModal() {
+  document.getElementById('domainId').value = '';
+  document.getElementById('domainName').value = '';
+  document.getElementById('domainUrl').value = '';
+  document.getElementById('domainModalTitle').textContent = '➕ 添加优选域名';
+  openModal('modalDomain');
+}
+
+function editDomain(id) {
+  const d = allDomains.find(x => x.id === id);
+  if (!d) return;
+  document.getElementById('domainId').value = d.id;
+  document.getElementById('domainName').value = d.name;
+  document.getElementById('domainUrl').value = 'https://' + d.domain;
+  document.getElementById('domainModalTitle').textContent = '✏️ 编辑优选域名';
+  openModal('modalDomain');
+}
+
+async function saveDomain() {
+  const id = document.getElementById('domainId').value;
+  const name = document.getElementById('domainName').value.trim();
+  const url = document.getElementById('domainUrl').value.trim();
+  
+  if (!name) { showToast('请输入名称'); return; }
+  if (!url) { showToast('请输入域名'); return; }
+  
+  let domain = url.replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '');
+  
+  let method = 'POST';
+  let endpoint = '/admin/api/optimized-domains';
+  if (id) {
+    method = 'PUT';
+    endpoint = '/admin/api/optimized-domains/' + id;
+  }
+  
+  const r = await fetch(endpoint, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ domain, name })
+  });
+  const d = await r.json();
+  if (!d.success) { showToast('保存失败'); return; }
+  closeModal('modalDomain');
+  showToast('保存成功');
+  loadDomains();
+}
+
+async function delDomain(id) {
+  if (!confirm('确定删除此优选域名？')) return;
+  const r = await fetch('/admin/api/optimized-domains/' + id, { method: 'DELETE' });
+  const d = await r.json();
+  if (d.success) {
+    showToast('已删除');
+    loadDomains();
+  } else {
+    showToast('删除失败');
+  }
+}
+
+async function testDomains() {
+  document.getElementById('adminDomainResult').innerHTML = '<p class="muted">测速中...</p>';
+  const r = await fetch('/admin/api/speedtest/domains', { method: 'POST' });
+  const d = await r.json();
+  
+  if (d.best) {
+    bestDomain = d.best;
+    document.getElementById('btn-replace-dns').style.display = 'inline-flex';
+  }
+  
+  let html = '<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
+  (d.results || []).forEach(x => {
+    const statusText = x.latency >= 0 ? ((x.latency < 100 ? '极快' : x.latency < 300 ? '良好' : '较慢')) : '超时';
+    const statusClass = x.latency >= 0 ? ((x.latency < 100 ? 'tag-fast' : x.latency < 300 ? 'tag-good' : 'tag-slow')) : 'tag-timeout';
+    html += '<tr' + (d.best && d.best.domain === x.domain ? ' class="best"' : '') + '>' +
+      '<td>' + (x.name || '—') + '</td>' +
+      '<td><code>' + x.domain + '</code></td>' +
+      '<td>' + (x.latency >= 0 ? x.latency + 'ms' : '超时') + '</td>' +
+      '<td><span class="tag ' + statusClass + '">' + statusText + '</span></td>' +
+    '</tr>';
+  });
+  document.getElementById('adminDomainResult').innerHTML = html + '</tbody></table>';
+}
+
+async function loadDNSConfig() {
+  const r = await fetch('/admin/api/dns-config');
+  if (r.status === 401) { location.reload(); return; }
+  const d = await r.json();
+  if (d.success) {
+    dnsConfig = d.config;
+    renderDNSConfig(d.config, d.zones);
+  }
+}
+
+function renderDNSConfig(config, zones) {
+  const el = document.getElementById('dnsConfig');
+  let html = '';
+  
+  if (zones && zones.length) {
+    html = '<div class="form-group"><label>可用区域</label><select id="zoneSelect">';
+    zones.forEach(z => {
+      html += '<option value="' + z.id + '">' + z.name + '</option>';
+    });
+    html += '</select></div>';
+  }
+  
+  if (config) {
+    html += '<div class="muted" style="margin-top:16px"><strong>当前配置:</strong> ' +
+      (config.dnsName ? config.dnsName : '未设置') + ' → ' +
+      (config.currentDomain ? config.currentDomain : '未设置') + '</div>';
+  }
+  
+  if (!html) {
+    html = '<p class="muted">请在环境变量中配置 CLOUDFLARE_API_KEY 和 CLOUDFLARE_EMAIL</p>';
+  }
+  
+  el.innerHTML = html;
+}
+
+async function openDNSModal() {
+  if (!bestDomain) {
+    showToast('请先测速找到最优域名');
+    return;
+  }
+  
+  const r = await fetch('/admin/api/dns-config');
+  const d = await r.json();
+  
+  if (d.success && d.zones && d.zones.length) {
+    const zoneSelect = document.getElementById('dnsZone');
+    zoneSelect.innerHTML = d.zones.map(z => '<option value="' + z.id + '">' + z.name + '</option>').join('');
+  }
+  
+  document.getElementById('dnsName').value = dnsConfig?.dnsName || 'emby';
+  document.getElementById('dnsTarget').value = bestDomain.domain;
+  document.getElementById('dnsPreview').textContent = (dnsConfig?.dnsName || 'emby') + '.yourdomain.com';
+  
+  openModal('modalDNS');
+}
+
+async function replaceDNS() {
+  const zoneId = document.getElementById('dnsZone').value;
+  const dnsName = document.getElementById('dnsName').value.trim();
+  const targetDomain = document.getElementById('dnsTarget').value.trim();
+  
+  if (!zoneId) { showToast('请选择区域'); return; }
+  if (!dnsName) { showToast('请输入DNS名称'); return; }
+  if (!targetDomain) { showToast('请输入目标域名'); return; }
+  
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '替换中...';
+  
+  const r = await fetch('/admin/api/dns/replace', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zoneId, dnsName, targetDomain })
+  });
+  const d = await r.json();
+  
+  if (d.success) {
+    showToast('DNS 替换成功！');
+    closeModal('modalDNS');
+    loadDNSConfig();
+  } else {
+    showToast(d.error || 'DNS 替换失败');
+  }
+  
+  btn.disabled = false;
+  btn.textContent = '🚀 替换';
+}
+
+document.getElementById('routePrefix').addEventListener('input', function() {
+  document.getElementById('prefixPreview').textContent = this.value.trim() || 'myemby';
+});
+
+document.getElementById('dnsName').addEventListener('input', function() {
+  document.getElementById('dnsPreview').textContent = (this.value.trim() || 'emby') + '.yourdomain.com';
 });
 
 loadRoutes();
+loadDomains();
+loadDNSConfig();
 </script></body></html>`;
 }
 
@@ -1084,15 +1585,15 @@ export default {
     if (url.pathname === '/api/edge-info') return json(await getEdgeInfo(request));
 
     if (url.pathname === '/api/ping-host') {
-      const host = (url.searchParams.get('host') || '').replace(/^https?:\/\//, '').split('/')[0];
+      const host = (url.searchParams.get('host') || '').replace(/^https?:\\/\\//, '').split('/')[0];
       if (!host) return json({ ms: -1, error: 'missing host' });
-      const ms = await speedtestUrl(`https://${host}/cdn-cgi/trace`, 5000);
+      const ms = await speedtestUrl('https://' + host + '/cdn-cgi/trace', 5000);
       return json({ ms, host });
     }
 
     if (url.pathname === '/api/domains/speed') {
       if (url.searchParams.get('edge') === '1') {
-        const data = await speedtestOptimizedFromEdge();
+        const data = await speedtestOptimizedFromEdge(env);
         return json({ cached: false, edge: true, best: data.best, results: data.results });
       }
       return json({ cached: false, results: [] });
@@ -1125,7 +1626,7 @@ export default {
     if (looksLikeDirectUrl) {
       let path = url.pathname.substring(1);
       if (path.startsWith('/')) return new Response('Invalid proxy format', { status: 400 });
-      path = path.replace(/^(https?)\/(?!\/)/, '$1://');
+      path = path.replace(/^(https?)\\/(?!\\/)/, '$1://');
       if (!path.startsWith('http')) path = 'https://' + path;
       try {
         const upstreamUrl = new URL(path);
