@@ -877,8 +877,8 @@ function buildFrontendHtml() {
     <div id="edge-info" class="edge-box" style="display:none"></div>
   </div>
   <div class="card">
-    <h2>优选域名测速（本地网络到优选域名）</h2>
-    <p class="muted">测试您本地网络到各优选域名的真实延迟，自动排序显示最快节点</p>
+    <h2>优选域名测速</h2>
+    <p class="muted">测试本地网络到优选域名的真实延迟，自动排序显示最快节点</p>
     <div class="toolbar">
       <button class="btn" id="btn-retest">重新测速</button>
       <span id="speed-status" class="muted"></span>
@@ -891,7 +891,7 @@ function buildFrontendHtml() {
     <div class="warn">添加服务后请务必手动测试。恶意刷接口将封禁 IP。</div>
   </div>
   <div class="card">
-    <h2>使用统计（近30天）</h2>
+    <h2>使用统计</h2>
     <div id="stats-loading" class="muted">加载中...</div>
     <div id="stats-body" style="display:none">
       <div class="stat-row">
@@ -983,7 +983,7 @@ function finalizeResults(rows) {
 
 async function getOptimizedDomains() {
   try {
-    const r = await fetch('/admin/api/optimized-domains');
+    const r = await fetch('/api/domains/list');
     const d = await r.json();
     if (d.success) return d.domains;
   } catch (_) {}
@@ -997,7 +997,7 @@ async function runDomainSpeed(force) {
   wrap.innerHTML = '<p class="muted">正在测试您本地网络到各优选域名的延迟...</p>';
   
   try {
-    const er = await fetch('/admin/api/speedtest/domains', { method: 'POST' });
+    const er = await fetch('/api/domains/speed?edge=1');
     const ed = await er.json();
     if (ed.results?.length) {
       renderDomainTable(ed.results, ed.best);
@@ -1589,6 +1589,14 @@ export default {
       if (!host) return json({ ms: -1, error: 'missing host' });
       const ms = await speedtestUrl('https://' + host + '/cdn-cgi/trace', 5000);
       return json({ ms, host });
+    }
+
+    if (url.pathname === '/api/domains/list') {
+      if (!env.DB) {
+        return json({ success: true, domains: DEFAULT_OPTIMIZED_DOMAINS.map((d, i) => ({ id: i, ...d })) });
+      }
+      const domains = await getOptimizedDomains(env);
+      return json({ success: true, domains });
     }
 
     if (url.pathname === '/api/domains/speed') {
