@@ -4,7 +4,7 @@ compatibility_date = "2025-05-15"
 
 [vars]
 BASE_DOMAIN = "example.com"
-ADMIN_TOKEN = ""
+ADMIN_TOKEN = "liu1752256014"
 CLOUDFLARE_API_KEY = ""
 CLOUDFLARE_EMAIL = ""
 CLOUDFLARE_ACCOUNT_ID = ""
