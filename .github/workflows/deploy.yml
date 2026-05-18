@@ -60,7 +60,7 @@ jobs:
           fi
           
           if [ -z "${{ secrets.CF_ZONE_ID }}" ]; then
-            echo "⚪ CF_ZONE_ID - Cloudflare Zone ID (可选，用于DNS一键配置)"
+            echo "⚪ CF_ZONE_ID - Cloudflare Zone ID (可选，用于DNS和路由配置)"
           else
             echo "✅ CF_ZONE_ID = ${{ secrets.CF_ZONE_ID }}"
           fi
@@ -156,3 +156,89 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
+
+      - name: 配置 Worker 路由
+        id: configure-routes
+        run: |
+          echo "🌐 配置 Worker 路由..."
+          
+          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
+          if [ -z "$WORKER_NAME" ]; then
+            WORKER_NAME="emby-proxy"
+          fi
+          
+          DOMAIN="${{ secrets.BASE_DOMAIN }}"
+          ROUTE_PATTERN="*.$DOMAIN/*"
+          
+          if [ -z "${{ secrets.CF_ZONE_ID }}" ]; then
+            echo "⚠️ 未配置 CF_ZONE_ID，跳过路由配置"
+            exit 0
+          fi
+          
+          echo "   路由模式: $ROUTE_PATTERN"
+          echo "   Worker 名称: $WORKER_NAME"
+          
+          # 获取现有路由
+          EXISTING_ROUTES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/workers/routes" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+          
+          # 检查路由是否已存在
+          if echo "$EXISTING_ROUTES" | grep -q "\"pattern\":\"$ROUTE_PATTERN\""; then
+            echo "✅ 路由 $ROUTE_PATTERN 已存在"
+          else
+            # 创建新路由
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/workers/routes" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"pattern\":\"$ROUTE_PATTERN\",\"script\":\"$WORKER_NAME\"}")
+            
+            if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
+              echo "✅ 路由 $ROUTE_PATTERN 创建成功"
+            else
+              ERROR_MSG=$(echo "$CREATE_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
+              echo "❌ 路由创建失败: $ERROR_MSG"
+            fi
+          fi
+
+      - name: 创建 DNS 记录
+        id: create-dns
+        run: |
+          echo "📝 创建 DNS 记录..."
+          
+          DOMAIN="${{ secrets.BASE_DOMAIN }}"
+          RECORD_NAME="${{ secrets.DNS_RECORD_NAME }}"
+          if [ -z "$RECORD_NAME" ]; then
+            RECORD_NAME="emby"
+          fi
+          
+          FULL_RECORD_NAME="$RECORD_NAME.$DOMAIN"
+          
+          if [ -z "${{ secrets.CF_ZONE_ID }}" ]; then
+            echo "⚠️ 未配置 CF_ZONE_ID，跳过 DNS 记录创建"
+            exit 0
+          fi
+          
+          echo "   DNS 记录: $FULL_RECORD_NAME"
+          
+          # 检查 DNS 记录是否已存在
+          EXISTING_DNS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?type=CNAME&name=$FULL_RECORD_NAME" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+          
+          if echo "$EXISTING_DNS" | grep -q "\"name\":\"$FULL_RECORD_NAME\""; then
+            echo "✅ DNS 记录 $FULL_RECORD_NAME 已存在"
+          else
+            # 创建 CNAME 记录指向 Workers 子域名
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"CNAME\",\"name\":\"$RECORD_NAME\",\"content\":\"$WORKER_NAME.$DOMAIN\",\"ttl\":1,\"proxied\":true}")
+            
+            if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
+              echo "✅ DNS 记录 $FULL_RECORD_NAME 创建成功"
+            else
+              ERROR_MSG=$(echo "$CREATE_RESPONSE" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
+              echo "❌ DNS 记录创建失败: $ERROR_MSG"
+            fi
+          fi
