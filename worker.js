@@ -1,18 +1,19 @@
-const CURRENT_VERSION = '3.1-simplified';
+const CURRENT_VERSION = '3.2-optimized';
 
+// 优化的优选域名列表 - 移除了子域名前缀
 const OPTIMIZED_DOMAINS = [
-  { subdomain: 'proxy1', domain: 'cf.090227.xyz', name: 'CF优选-090227' },
-  { subdomain: 'proxy2', domain: 'cf.877774.xyz', name: 'CF优选-877774' },
-  { subdomain: 'proxy3', domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选' },
-  { subdomain: 'proxy4', domain: 'saas.sin.fan', name: 'MIYU优选' },
-  { subdomain: 'proxy5', domain: 'bestcf.030101.xyz', name: 'Mingyu优选' },
-  { subdomain: 'proxy6', domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选' },
-  { subdomain: 'proxy7', domain: 'cf.tencentapp.cn', name: '腾讯泛域名' },
-  { subdomain: 'proxy8', domain: 'www.visa.cn', name: 'Visa官方' },
-  { subdomain: 'proxy9', domain: 'mfa.gov.ua', name: '乌克兰外交部' },
-  { subdomain: 'proxy10', domain: 'www.shopify.com', name: 'Shopify官方' },
-  { subdomain: 'proxy11', domain: 'store.ubi.com', name: '育碧商店' },
-  { subdomain: 'proxy12', domain: 'staticdelivery.nexusmods.com', name: 'NexusMods' },
+  { domain: 'cf.090227.xyz', name: 'CF优选-090227' },
+  { domain: 'cf.877774.xyz', name: 'CF优选-877774' },
+  { domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选' },
+  { domain: 'saas.sin.fan', name: 'MIYU优选' },
+  { domain: 'bestcf.030101.xyz', name: 'Mingyu优选' },
+  { domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选' },
+  { domain: 'cf.tencentapp.cn', name: '腾讯泛域名' },
+  { domain: 'www.visa.cn', name: 'Visa官方' },
+  { domain: 'mfa.gov.ua', name: '乌克兰外交部' },
+  { domain: 'www.shopify.com', name: 'Shopify官方' },
+  { domain: 'store.ubi.com', name: '育碧商店' },
+  { domain: 'staticdelivery.nexusmods.com', name: 'NexusMods' },
 ];
 
 const RESERVED_ALIASES = new Set([
@@ -28,7 +29,7 @@ const MANUAL_REDIRECT_DOMAINS = [
   'xiaoya.pro', 'myqcloud.com', 'cloudfront.net', 'akamaized.net', 'fastly.net', 'hwcdn.net', 'bytecdn.cn', 'bdcdn.net',
 ];
 
-const DOMAIN_PROXY_RULES = { 'biliblili.uk': 'example.com' };
+const DOMAIN_PROXY_RULES = { 'bilibili.uk': 'example.com' };
 const JP_COLOS = ['NRT', 'KIX', 'FUK', 'OKA'];
 
 const blocker = {
@@ -43,7 +44,6 @@ const CONFIG = {
   pikpakProxyUrl: 'https://pp.255432.xyz',
   enableStats: true,
   cacheEnabled: true,
-  domainCacheTtlMs: 3600000,
 };
 
 const PIKPAK_DOMAINS = [
@@ -115,10 +115,6 @@ function getClientCacheKey(request) {
   return `${cf.country || 'XX'}|${cf.city || ''}|${cf.asn || ''}|${ipKey}`;
 }
 
-function optimizedHost(item) {
-  return `${item.subdomain}.${item.domain}`;
-}
-
 function latencyStatus(ms) {
   if (ms < 0) return 'timeout';
   if (ms < 100) return 'fast';
@@ -133,24 +129,19 @@ async function initDatabase(env) {
       prefix TEXT PRIMARY KEY, target TEXT NOT NULL,
       remark TEXT DEFAULT '', last_play TEXT DEFAULT '',
       cache_img TEXT DEFAULT 'on', compat_mode TEXT DEFAULT 'off',
-      sort_order INTEGER DEFAULT 0, target_latencies TEXT DEFAULT '')`),
+      sort_order INTEGER DEFAULT 0
+    )`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS visitor_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT, prefix TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, ua TEXT)`),
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip TEXT, country TEXT, ua TEXT
+    )`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS request_stats (
-      prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date))`),
+      prefix TEXT, date TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(prefix, date)
+    )`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS auto_emby_daily_stats (
-      date TEXT PRIMARY KEY, playing_count INTEGER DEFAULT 0, playback_info_count INTEGER DEFAULT 0)`),
-    env.DB.prepare(`CREATE TABLE IF NOT EXISTS domain_speed_cache (
-      cache_key TEXT NOT NULL, subdomain TEXT NOT NULL, domain TEXT NOT NULL,
-      display_name TEXT, latency_ms INTEGER DEFAULT -1, status TEXT DEFAULT 'unknown',
-      tested_at INTEGER NOT NULL, PRIMARY KEY (cache_key, subdomain, domain))`),
-    env.DB.prepare(`CREATE TABLE IF NOT EXISTS domain_best_cache (
-      cache_key TEXT PRIMARY KEY, best_host TEXT, best_name TEXT, best_latency INTEGER,
-      tested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`),
+      date TEXT PRIMARY KEY, playing_count INTEGER DEFAULT 0, playback_info_count INTEGER DEFAULT 0
+    )`),
   ]);
-  try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN target_latencies TEXT DEFAULT ''`); } catch(e) {}
-  try { await env.DB.exec(`ALTER TABLE routes ADD COLUMN compat_mode TEXT DEFAULT 'off'`); } catch(e) {}
   dbReady = true;
 }
 
@@ -195,10 +186,10 @@ async function speedtestUrl(urlStr, timeoutMs = 5000) {
 async function speedtestOptimizedFromEdge() {
   const results = [];
   for (const item of OPTIMIZED_DOMAINS) {
-    const host = optimizedHost(item);
+    const host = item.domain;
     const ms = await speedtestUrl(`https://${host}/cdn-cgi/trace`, 4000);
     results.push({
-      subdomain: item.subdomain, domain: item.domain, name: item.name, host,
+      domain: item.domain, name: item.name, host,
       latency: ms, status: latencyStatus(ms),
     });
   }
@@ -210,96 +201,6 @@ async function speedtestOptimizedFromEdge() {
   });
   const best = results.find((r) => r.latency >= 0);
   return { results, best: best ? best.host : null };
-}
-
-async function speedtestRouteTargets(env, prefix) {
-  const route = await env.DB.prepare('SELECT * FROM routes WHERE prefix = ?').bind(prefix).first();
-  if (!route) return [];
-  const targets = route.target.split(',').map(s => s.trim()).filter(Boolean);
-  const latencies = {};
-  const out = [];
-  for (const t of targets) {
-    const ms = await speedtestUrl(t);
-    latencies[t] = ms;
-    out.push({ url: t, latency: ms, status: latencyStatus(ms) });
-  }
-  await env.DB.prepare('UPDATE routes SET target_latencies = ? WHERE prefix = ?')
-    .bind(JSON.stringify(latencies), prefix).run();
-  out.sort((a, b) => {
-    if (a.latency < 0 && b.latency < 0) return 0;
-    if (a.latency < 0) return 1;
-    if (b.latency < 0) return -1;
-    return a.latency - b.latency;
-  });
-  return out;
-}
-
-async function speedtestAllRoutes(env) {
-  const { results: routes } = await env.DB.prepare('SELECT prefix, target FROM routes ORDER BY sort_order, prefix').all();
-  const allResults = {};
-  for (const route of routes || []) {
-    const targets = route.target.split(',').map(s => s.trim()).filter(Boolean);
-    const latencies = {};
-    for (const t of targets) {
-      const ms = await speedtestUrl(t);
-      latencies[t] = ms;
-    }
-    await env.DB.prepare('UPDATE routes SET target_latencies = ? WHERE prefix = ?')
-      .bind(JSON.stringify(latencies), route.prefix).run();
-    allResults[route.prefix] = Object.entries(latencies).map(([url, latency]) => ({
-      url, latency, status: latencyStatus(latency),
-    }));
-  }
-  return allResults;
-}
-
-async function saveDomainSpeedCache(env, cacheKey, rows) {
-  const now = Date.now();
-  const expires = now + CONFIG.domainCacheTtlMs;
-  const stmts = [];
-  for (const r of rows) {
-    stmts.push(env.DB.prepare(
-      `INSERT INTO domain_speed_cache (cache_key, subdomain, domain, display_name, latency_ms, status, tested_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(cache_key, subdomain, domain) DO UPDATE SET
-       latency_ms=excluded.latency_ms, status=excluded.status, tested_at=excluded.tested_at`
-    ).bind(cacheKey, r.subdomain, r.domain, r.name || r.display_name, r.latency, r.status, now));
-  }
-  const sorted = [...rows].filter((r) => r.latency >= 0).sort((a, b) => a.latency - b.latency);
-  const best = sorted[0];
-  if (best) {
-    const host = `${best.subdomain}.${best.domain}`;
-    stmts.push(env.DB.prepare(
-      `INSERT INTO domain_best_cache (cache_key, best_host, best_name, best_latency, tested_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET
-       best_host=excluded.best_host, best_name=excluded.best_name, best_latency=excluded.best_latency,
-       tested_at=excluded.tested_at, expires_at=excluded.expires_at`
-    ).bind(cacheKey, host, best.name || best.display_name, best.latency, now, expires));
-  }
-  await env.DB.batch(stmts);
-}
-
-async function loadDomainSpeedCache(env, cacheKey) {
-  const now = Date.now();
-  const best = await env.DB.prepare(
-    'SELECT * FROM domain_best_cache WHERE cache_key = ? AND expires_at > ?'
-  ).bind(cacheKey, now).first();
-  if (!best) return null;
-  const { results } = await env.DB.prepare(
-    'SELECT subdomain, domain, display_name, latency_ms, status, tested_at FROM domain_speed_cache WHERE cache_key = ? ORDER BY latency_ms ASC'
-  ).bind(cacheKey).all();
-  if (!results?.length) return null;
-  return {
-    cached: true,
-    cacheKey,
-    best: best.best_host,
-    bestName: best.best_name,
-    results: results.map((r) => ({
-      subdomain: r.subdomain, domain: r.domain, name: r.display_name, host: `${r.subdomain}.${r.domain}`,
-      latency: r.latency_ms, status: r.status,
-    })),
-    expiresAt: best.expires_at,
-  };
 }
 
 async function recordStats(env, type) {
@@ -367,9 +268,9 @@ async function handleAdminApi(request, env, url) {
         if (oldRow) currentSortOrder = oldRow.sort_order;
       }
       await env.DB.prepare(
-        'INSERT OR REPLACE INTO routes (prefix, target, remark, cache_img, compat_mode, sort_order, target_latencies) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        'INSERT OR REPLACE INTO routes (prefix, target, remark, cache_img, compat_mode, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
       ).bind(
-        prefix, data.target, data.remark || '', data.cache_img || 'on', data.compat_mode || 'off', currentSortOrder, ''
+        prefix, data.target, data.remark || '', data.cache_img || 'on', data.compat_mode || 'off', currentSortOrder
       ).run();
       return json({ success: true });
     }
@@ -379,16 +280,6 @@ async function handleAdminApi(request, env, url) {
       await env.DB.prepare('DELETE FROM routes WHERE prefix = ?').bind(normalizePrefix(prefix)).run();
       return json({ success: true });
     }
-  }
-
-  if (url.pathname === '/admin/api/speedtest/routes' && request.method === 'POST') {
-    const prefix = url.searchParams.get('prefix');
-    if (prefix) {
-      const results = await speedtestRouteTargets(env, normalizePrefix(prefix));
-      return json({ results });
-    }
-    const allResults = await speedtestAllRoutes(env);
-    return json({ results: allResults });
   }
 
   if (url.pathname === '/admin/api/speedtest/domains' && request.method === 'POST') {
@@ -401,51 +292,26 @@ async function handleAdminApi(request, env, url) {
 
 async function resolveProxyTarget(request, env, url) {
   const decodedPath = decodeURIComponent(url.pathname);
-  let upstreamUrls = [];
-  let enableCache = true;
-  let compatMode = false;
-  let matchedPrefix = null;
-  let needsSpeedTest = false;
-
   const pathParts = decodedPath.split('/').filter(Boolean);
-  const prefix = normalizeAlias(pathParts[0]);
+  const prefix = normalizePrefix(pathParts[0]);
   if (!prefix) return { error: new Response('Not Found', { status: 404 }) };
 
   const route = await env.DB.prepare('SELECT * FROM routes WHERE prefix = ?').bind(prefix).first();
   if (!route) return { error: new Response('404: 节点不存在', { status: 404 }) };
 
-  matchedPrefix = route.prefix;
-  enableCache = route.cache_img !== 'off';
-  compatMode = route.compat_mode === 'on';
+  const enableCache = route.cache_img !== 'off';
+  const compatMode = route.compat_mode === 'on';
   const remainingPath = '/' + pathParts.slice(1).join('/');
-  let targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
+  const targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
 
+  let upstreamUrls = [];
   if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) {
     upstreamUrls = [remainingPath.substring(1) + url.search];
-    enableCache = true;
   } else {
-    if (targetUrls.length > 1 && route.target_latencies) {
-      try {
-        const latencies = JSON.parse(route.target_latencies);
-        const hasAnyLatency = Object.values(latencies).some(v => typeof v === 'number' && v >= 0);
-        if (hasAnyLatency) {
-          targetUrls.sort((a, b) => {
-            const la = latencies[a];
-            const lb = latencies[b];
-            if (typeof la !== 'number' || la < 0) return 1;
-            if (typeof lb !== 'number' || lb < 0) return -1;
-            return la - lb;
-          });
-        }
-      } catch (_) {}
-    }
-    if (targetUrls.length > 1 && !route.target_latencies) {
-      needsSpeedTest = true;
-    }
     upstreamUrls = targetUrls.map(t => t.replace(/\/+$/, '') + remainingPath + url.search);
   }
 
-  return { upstreamUrls, enableCache, compatMode, matchedPrefix, needsSpeedTest };
+  return { upstreamUrls, enableCache, compatMode, matchedPrefix: route.prefix };
 }
 
 function normalizeAlias(a) {
@@ -453,14 +319,10 @@ function normalizeAlias(a) {
 }
 
 async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
-  const { enableCache = true, compatMode = false, matchedPrefix = null, needsSpeedTest = false } = opts;
+  const { enableCache = true, compatMode = false, matchedPrefix = null } = opts;
   const proxyOrigin = new URL(request.url).origin;
 
   if (!upstreamUrls.length) return new Response('404: Target empty', { status: 404 });
-
-  if (needsSpeedTest && matchedPrefix && env.DB && ctx?.waitUntil) {
-    ctx.waitUntil(speedtestRouteTargets(env, matchedPrefix));
-  }
 
   let firstUpstreamUrl;
   try {
@@ -491,7 +353,7 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
         env.DB.prepare(`UPDATE routes SET last_play = ? WHERE prefix = ?`).bind(nowTime, matchedPrefix),
         env.DB.prepare(`INSERT INTO visitor_logs (prefix, ip, country, ua) VALUES (?, ?, ?, ?)`).bind(matchedPrefix, clientIp, clientCountry, clientUa),
       ]));
-    } catch(_) {}
+    } catch (_) {}
   }
 
   const upgradeHeader = request.headers.get('Upgrade');
@@ -739,7 +601,6 @@ const PAGE_STYLE = `
   .target-row { background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(148, 163, 184, 0.1); border-radius: 12px; padding: 12px 16px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 12px; transition: all 0.2s ease; }
   .target-row:hover { background: rgba(15, 23, 42, 0.8); border-color: rgba(148, 163, 184, 0.2); }
   .target-url { color: #94a3b8; font-size: 13px; word-break: break-all; flex: 1; }
-  .target-latency { font-size: 13px; font-weight: 600; white-space: nowrap; }
   .route-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .meta-tag { font-size: 11px; padding: 3px 8px; background: rgba(148, 163, 184, 0.15); border-radius: 20px; color: #cbd5e1; }
   .modal { display: none; position: fixed; inset: 0; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px); z-index: 1000; padding: 20px; overflow: auto; animation: fadeIn 0.2s ease; }
@@ -767,20 +628,16 @@ const PAGE_STYLE = `
   .checkbox-label input[type="checkbox"] { width: 18px !important; height: 18px; accent-color: #60a5fa; cursor: pointer; flex-shrink: 0; }
   #toast { position: fixed; top: -60px; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); color: #f1f5f9; padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 500; transition: top 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; border: 1px solid rgba(96, 165, 250, 0.3); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3); }
   #toast.show { top: 20px; }
-  .target-inputs { display: flex; flex-direction: column; gap: 10px; }
-  .target-input-row { display: flex; gap: 8px; align-items: center; }
-  .target-input-row input { flex: 1; margin-bottom: 0; }
-  .target-input-row .btn-remove { background: rgba(248, 113, 113, 0.15); border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5; padding: 10px 14px; border-radius: 10px; cursor: pointer; font-size: 16px; flex-shrink: 0; }
 `;
 
 function buildFrontendHtml() {
   const domainListJson = JSON.stringify(OPTIMIZED_DOMAINS);
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Emby 反代 | 智能优选</title><style>${PAGE_STYLE}</style></head><body>
+<title>Emby 反代 | 自动测速优选</title><style>${PAGE_STYLE}</style></head><body>
 <div class="container">
   <div class="card">
     <h1>Emby 反向代理</h1>
-    <p class="muted">版本 ${CURRENT_VERSION} · 支持别名快捷入口与 CF 优选域名智能测速</p>
+    <p class="muted">版本 ${CURRENT_VERSION} · 支持别名快捷入口与优选域名自动测速</p>
     <p><a href="/admin" class="btn btn-outline">管理后台</a></p>
   </div>
   <div class="card">
@@ -789,8 +646,8 @@ function buildFrontendHtml() {
     <div id="edge-info" class="edge-box" style="display:none"></div>
   </div>
   <div class="card">
-    <h2>优选域名测速（用户网络 → 优选入口）</h2>
-    <p class="muted">按延迟排序；同网段 IP 一小时内复用缓存结果</p>
+    <h2>优选域名测速（本地网络到优选域名）</h2>
+    <p class="muted">测试您本地网络到各优选域名的真实延迟，自动排序显示最快节点</p>
     <div class="toolbar"><button class="btn" id="btn-retest">重新测速</button><span id="speed-status" class="muted"></span></div>
     <div id="domain-table-wrap"><p class="muted" id="domain-loading">正在测速...</p></div>
   </div>
@@ -838,9 +695,9 @@ function renderDomainTable(results, best) {
   if (!results.length) { wrap.innerHTML = '<p class="muted">无数据</p>'; return; }
   let html = '<table><thead><tr><th>#</th><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
   results.forEach((r, i) => {
-    const host = r.host || (r.subdomain+'.'+r.domain);
+    const host = r.host || r.domain;
     const isBest = best && best === host;
-    html += '<tr class="'+(isBest?'best':'')+'"><td>'+(i+1)+'</td><td>'+ (r.name||r.display_name||'') +'</td><td><code>'+host+'</code></td><td>'+(r.latency>=0?r.latency+' ms':'—')+'</td><td><span class="tag '+CLS[r.status||'timeout']+'">'+(TAG[r.status]||'—')+'</span></td></tr>';
+    html += '<tr class="'+(isBest?'best':'')+'"><td>'+(i+1)+'</td><td>'+ (r.name||'—') +'</td><td><code>'+host+'</code></td><td>'+(r.latency>=0?r.latency+' ms':'—')+'</td><td><span class="tag '+CLS[r.status||'timeout']+'">'+(TAG[r.status]||'—')+'</span></td></tr>';
   });
   wrap.innerHTML = html + '</tbody></table>';
 }
@@ -865,13 +722,13 @@ function pingMs(url, timeout) {
 }
 
 async function probeDomain(item) {
-  const host = item.subdomain + '.' + item.domain;
+  const host = item.domain;
   const paths = ['/cdn-cgi/trace', '/favicon.ico', '/'];
   for (const p of paths) {
     const ms = await pingMs('https://' + host + p, 7000);
     if (ms >= 0) {
       const status = ms < 100 ? 'fast' : ms < 300 ? 'good' : 'slow';
-      return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: ms, status, source: 'client' };
+      return { domain: item.domain, name: item.name, host, latency: ms, status, source: 'client' };
     }
   }
   try {
@@ -879,10 +736,10 @@ async function probeDomain(item) {
     const d = await r.json();
     if (d.ms >= 0) {
       const status = d.ms < 100 ? 'fast' : d.ms < 300 ? 'good' : 'slow';
-      return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: d.ms, status, source: 'edge' };
+      return { domain: item.domain, name: item.name, host, latency: d.ms, status, source: 'edge' };
     }
   } catch (_) {}
-  return { subdomain: item.subdomain, domain: item.domain, name: item.name, host, latency: -1, status: 'timeout', source: 'none' };
+  return { domain: item.domain, name: item.name, host, latency: -1, status: 'timeout', source: 'none' };
 }
 
 function finalizeResults(rows) {
@@ -894,57 +751,41 @@ function finalizeResults(rows) {
 async function runDomainSpeed(force) {
   const st = document.getElementById('speed-status');
   const wrap = document.getElementById('domain-table-wrap');
-  if (!force) {
-    try {
-      const cached = await fetch('/api/domains/speed');
-      const data = await cached.json();
-      if (data.cached && data.results?.length) {
-        st.textContent = '已使用缓存（约1小时有效）';
-        renderDomainTable(data.results, data.best);
-        return;
-      }
-    } catch(e) {}
-  }
-  st.textContent = '加载边缘测速...';
-  wrap.innerHTML = '<p class="muted">测速中...</p>';
-  let results = [];
+  st.textContent = '正在测速...';
+  wrap.innerHTML = '<p class="muted">正在测试您本地网络到各优选域名的延迟...</p>';
+  
   try {
     const er = await fetch('/api/domains/speed?edge=1');
     const ed = await er.json();
     if (ed.results?.length) {
-      results = ed.results;
-      finalizeResults(results);
-      renderDomainTable(results, ed.best);
+      renderDomainTable(ed.results, ed.best);
       st.textContent = '边缘测速完成，正在用您的网络复测...';
     }
   } catch (_) {}
+  
   const clientResults = await Promise.all(OPT_DOMAINS.map(probeDomain));
   finalizeResults(clientResults);
   const clientOk = clientResults.filter(r => r.latency >= 0).length;
+  const best = clientResults.find(r => r.latency >= 0);
+  renderDomainTable(clientResults, best ? best.host : null);
+  
   if (clientOk > 0) {
-    results = clientResults;
-    st.textContent = '浏览器测速完成（' + clientOk + '/12 可用）';
-    try {
-      await fetch('/api/domains/speed', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ results }) });
-    } catch(e) {}
-  } else if (!results.length) {
+    st.textContent = '测速完成！' + clientOk + ' 个域名可用，推荐使用: ' + (best ? best.host : '无');
+  } else {
     st.textContent = '测速失败，请检查网络或稍后重试';
   }
-  const best = results.find(r => r.latency >= 0);
-  renderDomainTable(results, best ? best.host : null);
-  if (best && clientOk > 0) st.textContent += ' · 推荐: ' + best.host;
 }
 
 async function loadStats() {
   try {
     const r = await fetch('/stats');
-    const data = await r.json();
-    if (data.error) { document.getElementById('stats-loading').textContent = data.error; return; }
+    const d = await r.json();
+    if (d.error) { document.getElementById('stats-loading').textContent = d.error; return; }
     document.getElementById('stats-loading').style.display = 'none';
     document.getElementById('stats-body').style.display = 'block';
-    document.getElementById('st-play').textContent = data.data.total.playing;
-    document.getElementById('st-pb').textContent = data.data.total.playbackInfo;
-    const daily = (data.data.dailyStats||[]).slice(0,10);
+    document.getElementById('st-play').textContent = d.data.total.playing;
+    document.getElementById('st-pb').textContent = d.data.total.playbackInfo;
+    const daily = (d.data.dailyStats||[]).slice(0,10);
     let t = '<table><tr><th>日期</th><th>播放</th><th>链接</th></tr>';
     daily.forEach(s => { t += '<tr><td>'+s.date+'</td><td>'+s.playing_count+'</td><td>'+s.playback_info_count+'</td></tr>'; });
     document.getElementById('daily-table').innerHTML = t + '</table>';
@@ -952,7 +793,9 @@ async function loadStats() {
 }
 
 document.getElementById('btn-retest').onclick = () => runDomainSpeed(true);
-loadEdge(); runDomainSpeed(false); loadStats();
+loadEdge(); 
+runDomainSpeed(false); 
+loadStats();
 </script></body></html>`;
 }
 
@@ -980,7 +823,7 @@ async function login(){
     const d=await r.json();
     if(d.ok){ location.href='/admin'; return; }
     err.textContent=d.error||'登录失败';
-  }catch(e){ err.textContent='请求失败: '+e.message; }
+  } catch(e){ err.textContent='请求失败: '+e.message; }
   btn.disabled=false; btn.textContent='登录';
 }
 </script></div></body></html>`;
@@ -1006,7 +849,6 @@ function buildAdminHtml() {
       <h2 style="border:none;margin:0;padding:0">📦 路由管理</h2>
       <div class="toolbar" style="margin:0">
         <button class="btn" onclick="openRouteModal()">➕ 添加路由</button>
-        <button class="btn btn-outline" onclick="speedtestAll()">⚡ 全局测速</button>
         <div class="search-box">
           <span class="search-icon">🔍</span>
           <input type="text" id="routeSearch" placeholder="搜索备注或路径..." oninput="filterRoutes()">
@@ -1017,8 +859,8 @@ function buildAdminHtml() {
   </div>
 
   <div class="card">
-    <h2>⚡ 优选域名测速</h2>
-    <p class="muted" style="margin-bottom:16px">测试边缘节点到优选入口的延迟</p>
+    <h2>⚡ 优选域名测速（边缘节点到优选域名）</h2>
+    <p class="muted" style="margin-bottom:16px">测试 Cloudflare 边缘节点到优选入口的延迟</p>
     <button class="btn" onclick="testDomains()">🚀 开始测速</button>
     <div id="adminDomainResult" style="margin-top:20px"></div>
   </div>
@@ -1041,15 +883,9 @@ function buildAdminHtml() {
       <p class="form-hint">访问路径: https://你的域名/<span id="prefixPreview">myemby</span></p>
     </div>
     <div class="form-group">
-      <label>目标线路 (target)</label>
-      <div id="targetInputs" class="target-inputs">
-        <div class="target-input-row">
-          <input type="url" class="target-url-input" placeholder="主线路地址 (如: https://emby.example.com:8096)">
-          <button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>
-        </div>
-      </div>
-      <button class="btn btn-outline btn-sm" style="margin-top:8px" onclick="addTargetInput()">➕ 添加备用线路</button>
-      <p class="form-hint">多个线路按顺序 failover，测速后按延迟排序优选</p>
+      <label>目标地址 (target)</label>
+      <input id="routeTarget" type="url" placeholder="https://emby.example.com:8096">
+      <p class="form-hint">多个地址用逗号分隔（按顺序切换）</p>
     </div>
     <div class="form-group">
       <label class="checkbox-label">
@@ -1082,38 +918,11 @@ function showToast(msg){
   setTimeout(function(){t.classList.remove('show');},2500);
 }
 
-function getLatencyInfo(ms){
-  if(ms<0)return {text:'超时',cls:'tag-timeout',color:'#f87171'};
-  if(ms<100)return {text:'极快',cls:'tag-fast',color:'#4ade80'};
-  if(ms<300)return {text:'良好',cls:'tag-good',color:'#93c5fd'};
-  return {text:'较慢',cls:'tag-slow',color:'#fbbf24'};
-}
-
-function addTargetInput(){
-  var container=document.getElementById('targetInputs');
-  var row=document.createElement('div');
-  row.className='target-input-row';
-  row.innerHTML='<input type="url" class="target-url-input" placeholder="备用线路地址"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
-  container.appendChild(row);
-}
-
-function removeTargetInput(btn){
-  var container=document.getElementById('targetInputs');
-  if(container.querySelectorAll('.target-input-row').length>1){
-    btn.parentElement.remove();
-  }
-}
-
 async function loadRoutes(){
   const r=await fetch('/admin/api/routes');
   if(r.status===401){location.reload();return;}
   allRoutes=await r.json();
   renderRoutes(allRoutes);
-}
-
-function parseLatencies(latStr){
-  if(!latStr)return {};
-  try{return JSON.parse(latStr);}catch(e){return {};}
 }
 
 function renderRoutes(list){
@@ -1124,18 +933,14 @@ function renderRoutes(list){
   }
   el.innerHTML=list.map(r=>{
     const targets=r.target.split(',').map(s=>s.trim()).filter(Boolean);
-    const latencies=parseLatencies(r.target_latencies);
     const remarkName=r.remark||'未命名';
     const cacheStatus=r.cache_img!=='off';
     const compatStatus=r.compat_mode==='on';
 
     let targetsHtml='';
     targets.forEach((t,idx)=>{
-      const lat=latencies[t];
-      const latInfo=getLatencyInfo(lat);
       const tag=idx===0?'<span style="color:#4ade80;font-weight:bold;">[主]</span>':'<span style="color:#fbbf24;font-weight:bold;">[备'+idx+']</span>';
-      const latDisplay=typeof lat==='number'&&lat>=0?'<span class="target-latency" style="color:'+latInfo.color+'">'+lat+'ms <span class="tag '+latInfo.cls+'">'+latInfo.text+'</span></span>':'<span class="target-latency" style="color:#64748b">未测速</span>';
-      targetsHtml+='<div class="target-row">'+tag+' <span class="target-url"><code>'+t+'</code></span>'+latDisplay+'</div>';
+      targetsHtml+='<div class="target-row">'+tag+' <span class="target-url"><code>'+t+'</code></span></div>';
     });
 
     return '<div class="route-item" data-search="'+(remarkName+' '+r.prefix).toLowerCase()+'">'+
@@ -1152,7 +957,6 @@ function renderRoutes(list){
         (r.last_play?'<span class="meta-tag">📺 '+r.last_play+'</span>':'')+
       '</div>'+
       '<div class="route-actions">'+
-        '<button class="btn btn-sm btn-outline" onclick="speedtestRoute(\\''+r.prefix+'\\')">⚡ 测速</button>'+
         '<button class="btn btn-sm btn-outline" onclick="editRoute(\\''+r.prefix+'\\')">✏️ 编辑</button>'+
         '<button class="btn btn-sm btn-del" onclick="delRoute(\\''+r.prefix+'\\')">🗑️ 删除</button>'+
       '</div>'+
@@ -1171,12 +975,11 @@ function openRouteModal(){
   document.getElementById('oldPrefix').value='';
   document.getElementById('routeRemark').value='';
   document.getElementById('routePrefix').value='';
+  document.getElementById('routeTarget').value='';
   document.getElementById('routeCache').checked=true;
   document.getElementById('routeCompat').checked=false;
   document.getElementById('prefixPreview').textContent='myemby';
   document.getElementById('routeModalTitle').textContent='➕ 添加路由';
-  var container=document.getElementById('targetInputs');
-  container.innerHTML='<div class="target-input-row"><input type="url" class="target-url-input" placeholder="主线路地址 (如: https://emby.example.com:8096)"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button></div>';
   openModal('modalRoute');
 }
 
@@ -1186,56 +989,34 @@ function editRoute(prefix){
   document.getElementById('oldPrefix').value=r.prefix;
   document.getElementById('routeRemark').value=r.remark||'';
   document.getElementById('routePrefix').value=r.prefix;
+  document.getElementById('routeTarget').value=r.target;
   document.getElementById('routeCache').checked=r.cache_img!=='off';
   document.getElementById('routeCompat').checked=r.compat_mode==='on';
   document.getElementById('prefixPreview').textContent=r.prefix;
   document.getElementById('routeModalTitle').textContent='✏️ 编辑路由';
-
-  var container=document.getElementById('targetInputs');
-  container.innerHTML='';
-  var targets=r.target.split(',').map(s=>s.trim()).filter(Boolean);
-  targets.forEach(function(t){
-    var row=document.createElement('div');
-    row.className='target-input-row';
-    row.innerHTML='<input type="url" class="target-url-input" value="'+t+'"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
-    container.appendChild(row);
-  });
-  if(!targets.length){
-    var row=document.createElement('div');
-    row.className='target-input-row';
-    row.innerHTML='<input type="url" class="target-url-input" placeholder="主线路地址"><button class="btn-remove" onclick="removeTargetInput(this)" title="移除">✕</button>';
-    container.appendChild(row);
-  }
   openModal('modalRoute');
 }
 
 async function saveRoute(){
   const oldPrefix=document.getElementById('oldPrefix').value;
   const remark=document.getElementById('routeRemark').value.trim();
-  const prefix=document.getElementById('routePrefix').value.trim().replace(/^\\/+|\\/+$/g,'');
+  const prefix=document.getElementById('routePrefix').value.trim().replace(/^\/+|\/+$/g,'');
   const cache_img=document.getElementById('routeCache').checked?'on':'off';
   const compat_mode=document.getElementById('routeCompat').checked?'on':'off';
-
-  var targetInputs=document.querySelectorAll('.target-url-input');
-  var targets=[];
-  targetInputs.forEach(function(inp){
-    var val=inp.value.trim().replace(/\\/$/g,'');
-    if(val)targets.push(val);
-  });
-  const target=targets.join(',');
+  const target=document.getElementById('routeTarget').value.trim();
 
   if(!prefix){showToast('请输入路径');return;}
-  if(!target){showToast('请至少填写一个主线路地址');return;}
+  if(!target){showToast('请至少填写一个目标地址');return;}
 
   document.getElementById('prefixPreview').textContent=prefix||'myemby';
 
   const r=await fetch('/admin/api/routes',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({oldPrefix:oldPrefix,prefix:prefix,target:target,remark:remark,cache_img:cache_img,compat_mode:compat_mode})
+    body:JSON.stringify({oldPrefix,prefix,target,remark,cache_img,compat_mode})
   });
-  const j=await r.json();
-  if(!r.ok){showToast(j.error||'保存失败');return;}
+  const d=await r.json();
+  if(!r.ok){showToast(d.error||'保存失败');return;}
   closeModal('modalRoute');
   showToast('保存成功');
   loadRoutes();
@@ -1248,35 +1029,19 @@ async function delRoute(prefix){
   loadRoutes();
 }
 
-async function speedtestRoute(prefix){
-  showToast('测速中...');
-  const r=await fetch('/admin/api/speedtest/routes?prefix='+encodeURIComponent(prefix),{method:'POST'});
-  const d=await r.json();
-  const ok=(d.results||[]).filter(x=>x.latency>=0).length;
-  showToast('测速完成，'+ok+'条线路可用');
-  loadRoutes();
-}
-
-async function speedtestAll(){
-  showToast('全局测速中，请耐心等待...');
-  const r=await fetch('/admin/api/speedtest/routes',{method:'POST'});
-  const d=await r.json();
-  showToast('全局测速完成');
-  loadRoutes();
-}
-
 async function testDomains(){
   document.getElementById('adminDomainResult').innerHTML='<p class="muted">测速中...</p>';
   const r=await fetch('/admin/api/speedtest/domains',{method:'POST'});
   const d=await r.json();
   let h='<table><thead><tr><th>名称</th><th>域名</th><th>延迟</th><th>状态</th></tr></thead><tbody>';
   (d.results||[]).forEach(x=>{
-    const status=getLatencyInfo(x.latency);
-    h+='<tr'+(d.best===x.host?' class="best"':'')+'>'+
+    const statusText=x.latency>=0?((x.latency<100?'极快':x.latency<300?'良好':'较慢')):'超时';
+    const statusClass=x.latency>=0?((x.latency<100?'tag-fast':x.latency<300?'tag-good':'tag-slow')):'tag-timeout';
+    h+='<tr'+(d.best===x.domain?' class="best"':'')+'>'+
       '<td>'+(x.name||'—')+'</td>'+
-      '<td><code>'+x.host+'</code></td>'+
+      '<td><code>'+x.domain+'</code></td>'+
       '<td>'+(x.latency>=0?x.latency+'ms':'超时')+'</td>'+
-      '<td><span class="tag '+status.cls+'">'+status.text+'</span></td>'+
+      '<td><span class="tag '+statusClass+'">'+statusText+'</span></td>'+
     '</tr>';
   });
   document.getElementById('adminDomainResult').innerHTML=h+'</tbody></table>';
@@ -1287,8 +1052,7 @@ document.getElementById('routePrefix').addEventListener('input',function(){
 });
 
 loadRoutes();
-</script>
-</body></html>`;
+</script></body></html>`;
 }
 
 export default {
@@ -1306,13 +1070,6 @@ export default {
     }
 
     if (env.DB) await initDatabase(env);
-
-    if (url.pathname === '/__client_rtt__') {
-      return new Response(null, {
-        status: 204,
-        headers: { 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' },
-      });
-    }
 
     if (url.pathname === '/') return html(buildFrontendHtml());
     if (url.pathname === '/favicon.ico') return new Response('', { headers: { 'Content-Type': 'image/x-icon' } });
@@ -1334,35 +1091,11 @@ export default {
     }
 
     if (url.pathname === '/api/domains/speed') {
-      const cacheKey = getClientCacheKey(request);
-      if (request.method === 'GET') {
-        if (url.searchParams.get('edge') === '1') {
-          const data = await speedtestOptimizedFromEdge();
-          const results = data.results.map((r) => ({
-            subdomain: r.subdomain, domain: r.domain, name: r.name, host: r.host,
-            latency: r.latency, status: r.status, source: 'edge',
-          }));
-          return json({ cached: false, edge: true, best: data.best, results });
-        }
-        if (!env.DB) return json({ cached: false, cacheKey, results: [] });
-        const cached = await loadDomainSpeedCache(env, cacheKey);
-        if (cached) return json(cached);
-        return json({ cached: false, cacheKey, results: [], domains: OPTIMIZED_DOMAINS });
+      if (url.searchParams.get('edge') === '1') {
+        const data = await speedtestOptimizedFromEdge();
+        return json({ cached: false, edge: true, best: data.best, results: data.results });
       }
-      if (request.method === 'POST') {
-        if (!env.DB) return json({ success: false, error: 'DB not bound' }, 500);
-        const body = await request.json();
-        const rows = (body.results || []).map((r) => ({
-          subdomain: r.subdomain,
-          domain: r.domain,
-          name: r.name || r.display_name,
-          latency: r.latency,
-          status: r.status || latencyStatus(r.latency),
-        }));
-        await saveDomainSpeedCache(env, cacheKey, rows);
-        const best = rows.filter((r) => r.latency >= 0).sort((a, b) => a.latency - b.latency)[0];
-        return json({ success: true, best: best ? `${best.subdomain}.${best.domain}` : null });
-      }
+      return json({ cached: false, results: [] });
     }
 
     if (url.pathname === '/admin/api/login' && request.method === 'POST') {
@@ -1414,7 +1147,6 @@ export default {
       enableCache: resolved.enableCache,
       compatMode: resolved.compatMode,
       matchedPrefix: resolved.matchedPrefix,
-      needsSpeedTest: resolved.needsSpeedTest,
     });
   },
 };
