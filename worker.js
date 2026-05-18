@@ -238,18 +238,17 @@ async function saveDNSConfig(env, dnsName, currentDomain, zoneId) {
 }
 
 async function cloudflareAPICall(env, method, endpoint, body = null) {
-  const apiKey = env.CLOUDFLARE_API_KEY;
-  const email = env.CLOUDFLARE_EMAIL;
-  const accountId = env.CLOUDFLARE_ACCOUNT_ID;
+  const apiToken = env.CF_API_TOKEN;
+  const zoneId = env.CF_ZONE_ID;
+  const accountId = env.CF_ACCOUNT_ID;
   
-  if (!apiKey || !email) {
-    return { success: false, error: 'Cloudflare API credentials not configured' };
+  if (!apiToken) {
+    return { success: false, error: 'CF_API_TOKEN not configured' };
   }
   
   const url = `https://api.cloudflare.com/client/v4${endpoint}`;
   const headers = {
-    'X-Auth-Email': email,
-    'X-Auth-Key': apiKey,
+    'Authorization': 'Bearer ' + apiToken,
     'Content-Type': 'application/json',
   };
   
@@ -272,7 +271,9 @@ async function cloudflareAPICall(env, method, endpoint, body = null) {
 }
 
 async function getZones(env) {
-  return await cloudflareAPICall(env, 'GET', '/zones');
+  const accountId = env.CF_ACCOUNT_ID;
+  const endpoint = accountId ? '/zones?account.id=' + accountId : '/zones';
+  return await cloudflareAPICall(env, 'GET', endpoint);
 }
 
 async function getDNSRecords(env, zoneId) {
@@ -280,6 +281,7 @@ async function getDNSRecords(env, zoneId) {
 }
 
 async function createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain) {
+  if (!zoneId) zoneId = env.CF_ZONE_ID;
   const baseDomain = env.BASE_DOMAIN || 'example.com';
   const fullDNSName = `${dnsName}.${baseDomain}`;
   
@@ -1494,7 +1496,7 @@ function renderDNSConfig(config, zones) {
   }
   
   if (!html) {
-    html = '<p class="muted">请在环境变量中配置 CLOUDFLARE_API_KEY 和 CLOUDFLARE_EMAIL</p>';
+    html = '<p class="muted">请在环境变量中配置 CF_API_TOKEN</p>';
   }
   
   el.innerHTML = html;
