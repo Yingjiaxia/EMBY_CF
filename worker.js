@@ -732,7 +732,7 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
       try {
         const text = await finalResponse.clone().text();
         if (text.includes('http://') || text.includes('https://')) {
-          const modifiedText = text.replace(/(https?:\/\/[^\s]+)/g, (match) => {
+          const modifiedText = text.replace(/(https?:[^\s]+)/g, (match) => {
             try {
               const mUrl = new URL(match);
               const isDirectDomain = MANUAL_REDIRECT_DOMAINS.some(d => mUrl.hostname.endsWith(d));
@@ -1312,7 +1312,7 @@ function editRoute(prefix) {
 async function saveRoute() {
   const oldPrefix = document.getElementById('oldPrefix').value;
   const remark = document.getElementById('routeRemark').value.trim();
-  const prefix = document.getElementById('routePrefix').value.trim().replace(/^\\/+|\\/+$/g, '');
+  const prefix = document.getElementById('routePrefix').value.trim().replace(/^\/+|\/+$/g, '');
   const cache_img = document.getElementById('routeCache').checked ? 'on' : 'off';
   const compat_mode = document.getElementById('routeCompat').checked ? 'on' : 'off';
   const target = document.getElementById('routeTarget').value.trim();
@@ -1397,7 +1397,7 @@ async function saveDomain() {
   if (!name) { showToast('请输入名称'); return; }
   if (!url) { showToast('请输入域名'); return; }
   
-  let domain = url.replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '');
+  let domain = url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   
   let method = 'POST';
   let endpoint = '/admin/api/optimized-domains';
@@ -1585,7 +1585,7 @@ export default {
     if (url.pathname === '/api/edge-info') return json(await getEdgeInfo(request));
 
     if (url.pathname === '/api/ping-host') {
-      const host = (url.searchParams.get('host') || '').replace(/^https?:\\/\\//, '').split('/')[0];
+      const host = (url.searchParams.get('host') || '').replace(/^https?:\/\//, '').split('/')[0];
       if (!host) return json({ ms: -1, error: 'missing host' });
       const ms = await speedtestUrl('https://' + host + '/cdn-cgi/trace', 5000);
       return json({ ms, host });
@@ -1626,7 +1626,7 @@ export default {
     if (looksLikeDirectUrl) {
       let path = url.pathname.substring(1);
       if (path.startsWith('/')) return new Response('Invalid proxy format', { status: 400 });
-      path = path.replace(/^(https?)\\/(?!\\/)/, '$1://');
+      path = path.replace(/^(https?)\/(?!\/)/, '$1://');
       if (!path.startsWith('http')) path = 'https://' + path;
       try {
         const upstreamUrl = new URL(path);
