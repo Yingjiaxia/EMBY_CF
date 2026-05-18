@@ -175,33 +175,40 @@ jobs:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
 
       - name: 配置 Worker 路由
-        if: secrets.CF_ZONE_ID != ''
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          BASE_DOMAIN: ${{ secrets.BASE_DOMAIN }}
         run: |
-          echo "🌐 配置 Worker 路由..."
-          
-          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
-          if [ -z "$WORKER_NAME" ]; then
-            WORKER_NAME="emby-proxy"
+          if [ -z "$CF_ZONE_ID" ]; then
+            echo "⚪ CF_ZONE_ID 未配置，跳过路由配置"
+            exit 0
           fi
-          
-          DOMAIN="${{ secrets.BASE_DOMAIN }}"
-          ROUTE_PATTERN="*.$DOMAIN/*"
-          
+
+          echo "🌐 配置 Worker 路由..."
+
+          if [ -z "$CF_WORKER_NAME" ]; then
+            CF_WORKER_NAME="emby-proxy"
+          fi
+
+          ROUTE_PATTERN="*.$BASE_DOMAIN/*"
+
           echo "   路由模式: $ROUTE_PATTERN"
-          echo "   Worker 名称: $WORKER_NAME"
-          
-          EXISTING_ROUTES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/workers/routes" \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+          echo "   Worker 名称: $CF_WORKER_NAME"
+
+          EXISTING_ROUTES=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/workers/routes" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json")
-          
+
           if echo "$EXISTING_ROUTES" | grep -q "\"pattern\":\"$ROUTE_PATTERN\""; then
             echo "✅ 路由 $ROUTE_PATTERN 已存在"
           else
-            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/workers/routes" \
-              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/workers/routes" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"pattern\":\"$ROUTE_PATTERN\",\"script\":\"$WORKER_NAME\"}")
-            
+              -d "{\"pattern\":\"$ROUTE_PATTERN\",\"script\":\"$CF_WORKER_NAME\"}")
+
             if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
               echo "✅ 路由 $ROUTE_PATTERN 创建成功"
             else
@@ -210,36 +217,43 @@ jobs:
           fi
 
       - name: 创建 DNS 记录
-        if: secrets.CF_ZONE_ID != ''
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
+          BASE_DOMAIN: ${{ secrets.BASE_DOMAIN }}
+          DNS_RECORD_NAME: ${{ secrets.DNS_RECORD_NAME }}
         run: |
+          if [ -z "$CF_ZONE_ID" ]; then
+            echo "⚪ CF_ZONE_ID 未配置，跳过 DNS 记录创建"
+            exit 0
+          fi
+
           echo "📝 创建 DNS 记录..."
-          
-          DOMAIN="${{ secrets.BASE_DOMAIN }}"
-          RECORD_NAME="${{ secrets.DNS_RECORD_NAME }}"
-          if [ -z "$RECORD_NAME" ]; then
-            RECORD_NAME="emby"
+
+          if [ -z "$DNS_RECORD_NAME" ]; then
+            DNS_RECORD_NAME="emby"
           fi
-          
-          FULL_RECORD_NAME="$RECORD_NAME.$DOMAIN"
-          WORKER_NAME="${{ secrets.CF_WORKER_NAME }}"
-          if [ -z "$WORKER_NAME" ]; then
-            WORKER_NAME="emby-proxy"
+
+          FULL_RECORD_NAME="$DNS_RECORD_NAME.$BASE_DOMAIN"
+          if [ -z "$CF_WORKER_NAME" ]; then
+            CF_WORKER_NAME="emby-proxy"
           fi
-          
+
           echo "   DNS 记录: $FULL_RECORD_NAME"
-          
-          EXISTING_DNS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records?type=CNAME&name=$FULL_RECORD_NAME" \
-            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+
+          EXISTING_DNS=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$FULL_RECORD_NAME" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
             -H "Content-Type: application/json")
-          
+
           if echo "$EXISTING_DNS" | grep -q "\"name\":\"$FULL_RECORD_NAME\""; then
             echo "✅ DNS 记录 $FULL_RECORD_NAME 已存在"
           else
-            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/dns_records" \
-              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$RECORD_NAME\",\"content\":\"$WORKER_NAME.$DOMAIN\",\"ttl\":1,\"proxied\":true}")
-            
+              -d "{\"type\":\"CNAME\",\"name\":\"$DNS_RECORD_NAME\",\"content\":\"$CF_WORKER_NAME.$BASE_DOMAIN\",\"ttl\":1,\"proxied\":true}")
+
             if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
               echo "✅ DNS 记录 $FULL_RECORD_NAME 创建成功"
             else
