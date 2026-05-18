@@ -215,7 +215,7 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"pattern\":\"$ROUTE_PATTERN\",\"script\":\"$CF_WORKER_NAME\"}")
 
-            if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
+            if echo "$CREATE_RESPONSE" | grep -qE '"success"\s*:\s*true'; then
               echo "✅ 路由 $ROUTE_PATTERN 创建成功"
             else
               echo "❌ 路由创建失败: $CREATE_RESPONSE"
@@ -226,7 +226,6 @@ jobs:
         env:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_WORKER_NAME: ${{ secrets.CF_WORKER_NAME }}
           BASE_DOMAIN: ${{ secrets.BASE_DOMAIN }}
           DNS_RECORD_NAME: ${{ secrets.DNS_RECORD_NAME }}
         run: |
@@ -242,9 +241,6 @@ jobs:
           fi
 
           FULL_RECORD_NAME="$DNS_RECORD_NAME.$BASE_DOMAIN"
-          if [ -z "$CF_WORKER_NAME" ]; then
-            CF_WORKER_NAME="emby-proxy"
-          fi
 
           echo "   DNS 记录: $FULL_RECORD_NAME"
 
@@ -258,9 +254,9 @@ jobs:
             CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
               -H "Authorization: Bearer $CF_API_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "{\"type\":\"CNAME\",\"name\":\"$DNS_RECORD_NAME\",\"content\":\"$CF_WORKER_NAME.$BASE_DOMAIN\",\"ttl\":1,\"proxied\":true}")
+              -d "{\"type\":\"CNAME\",\"name\":\"$DNS_RECORD_NAME\",\"content\":\"$BASE_DOMAIN\",\"ttl\":1,\"proxied\":true}")
 
-            if echo "$CREATE_RESPONSE" | grep -q "\"success\":true"; then
+            if echo "$CREATE_RESPONSE" | grep -qE '"success"\s*:\s*true'; then
               echo "✅ DNS 记录 $FULL_RECORD_NAME 创建成功"
             else
               echo "❌ DNS 记录创建失败: $CREATE_RESPONSE"
