@@ -530,7 +530,10 @@ async function handleAdminApi(request, env, url) {
     }
     
     const result = await createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain);
-    return json(result);
+    if (result.success && result.result) {
+      return json({ success: true, result: result.result });
+    }
+    return json({ success: false, error: result.error || result.errors?.[0]?.message || 'DNS 替换失败', errors: result.errors });
   }
 
   return json({ error: 'Not found' }, 404);
@@ -1489,7 +1492,13 @@ async function loadDNSConfig() {
     const d = await r.json();
     if (d.success) {
       dnsConfig = d.config;
-      renderDNSConfig(d.config, d.zones, d.zonesError);
+      var baseDomain = '';
+      try {
+        var bdResp = await fetch('/api/config/base-domain');
+        var bdData = await bdResp.json();
+        baseDomain = bdData.baseDomain || '';
+      } catch(e) {}
+      renderDNSConfig(d.config, d.zones, d.zonesError, baseDomain);
     } else {
       document.getElementById('dnsConfig').innerHTML = '<p class="muted">加载失败</p>';
     }
@@ -1498,7 +1507,7 @@ async function loadDNSConfig() {
   }
 }
 
-function renderDNSConfig(config, zones, zonesError) {
+function renderDNSConfig(config, zones, zonesError, baseDomain) {
   const el = document.getElementById('dnsConfig');
   let html = '';
   
@@ -1516,10 +1525,22 @@ function renderDNSConfig(config, zones, zonesError) {
     html += '<p class="muted">未找到可用区域，请确认 CF_API_TOKEN 有 Zone:Read 权限</p>';
   }
   
-  if (config) {
-    html += '<div class="muted" style="margin-top:16px"><strong>当前配置:</strong> ' +
-      (config.dnsName ? config.dnsName : '未设置') + ' → ' +
-      (config.currentDomain ? config.currentDomain : '未设置') + '</div>';
+  var domainForCname = baseDomain || (zones && zones.length ? zones[0].name : '');
+  
+  if (config && config.dnsName) {
+    var cnameRecord = config.dnsName + '.' + domainForCname;
+    html += '<div style="margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:8px">';
+    html += '<div style="margin-bottom:8px"><strong>当前 CNAME 记录</strong></div>';
+    html += '<div style="font-size:15px;color:var(--accent)">📌 ' + cnameRecord + '</div>';
+    html += '<div style="font-size:13px;color:var(--muted);margin-top:4px">指向 → ' + (config.currentDomain || '未设置') + '</div>';
+    if (config.updatedAt) {
+      html += '<div style="font-size:12px;color:var(--muted);margin-top:4px">更新时间: ' + config.updatedAt + '</div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<div style="margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:8px">';
+    html += '<div style="color:var(--muted)">尚未配置 DNS 记录，请测速后点击一键替换DNS</div>';
+    html += '</div>';
   }
   
   el.innerHTML = html;
@@ -1561,19 +1582,31 @@ async function replaceDNS() {
   btn.disabled = true;
   btn.textContent = '替换中...';
   
-  const r = await fetch('/admin/api/dns/replace', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ zoneId, dnsName, targetDomain })
-  });
-  const d = await r.json();
-  
-  if (d.success) {
-    showToast('DNS 替换成功！');
-    closeModal('modalDNS');
-    loadDNSConfig();
-  } else {
-    showToast(d.error || 'DNS 替换失败');
+  try {
+    const r = await fetch('/admin/api/dns/replace', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zoneId, dnsName, targetDomain })
+    });
+    const d = await r.json();
+    
+    if (d.success) {
+      var recordInfo = d.result || {};
+      var recordName = recordInfo.name || (dnsName + '.' + (recordInfo.zone_name || ''));
+      var recordContent = recordInfo.content || targetDomain;
+      var recordType = recordInfo.type || 'CNAME';
+      var isProxied = recordInfo.proxied !== undefined ? recordInfo.proxied : true;
+      
+      showToast('✅ DNS 替换成功！' + recordName + ' → ' + recordContent);
+      closeModal('modalDNS');
+      
+      loadDNSConfig();
+    } else {
+      var errorMsg = d.error || d.errors?.[0]?.message || 'DNS 替换失败';
+      showToast('❌ ' + errorMsg);
+    }
+  } catch (e) {
+    showToast('❌ 请求失败: ' + e.message);
   }
   
   btn.disabled = false;
