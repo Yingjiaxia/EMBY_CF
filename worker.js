@@ -2,13 +2,13 @@ const CURRENT_VERSION = '3.3-enhanced';
 
 // 内置优选域名
 const DEFAULT_OPTIMIZED_DOMAINS = [
-  { domain: 'cf.090227.xyz', name: 'CF优选-090227', isBuiltin: true },
-  { domain: 'cf.877774.xyz', name: 'CF优选-877774', isBuiltin: true },
-  { domain: 'cloudflare-dl.byoip.top', name: '鱼皮优选', isBuiltin: true },
+  { domain: 'youxuan.cf.090227.xyz', name: 'CF优选-090227', isBuiltin: true },
+  { domain: 'cf.877774.xyz', name: '秋名山优选', isBuiltin: true },
+  { domain: 'cf.cf.cnae.top', name: 'NB优选', isBuiltin: true },
   { domain: 'saas.sin.fan', name: 'MIYU优选', isBuiltin: true },
   { domain: 'bestcf.030101.xyz', name: 'Mingyu优选', isBuiltin: true },
   { domain: 'cf.cloudflare.182682.xyz', name: 'WeTest优选', isBuiltin: true },
-  { domain: 'cf.tencentapp.cn', name: '腾讯泛域名', isBuiltin: true },
+  { domain: 'cf.tencentapp.cn', name: '无名氏维护域名', isBuiltin: true },
   { domain: 'www.visa.cn', name: 'Visa官方', isBuiltin: true },
   { domain: 'mfa.gov.ua', name: '乌克兰外交部', isBuiltin: true },
   { domain: 'www.shopify.com', name: 'Shopify官方', isBuiltin: true },
@@ -32,23 +32,9 @@ const MANUAL_REDIRECT_DOMAINS = [
 const DOMAIN_PROXY_RULES = { 'bilibili.uk': 'example.com' };
 const JP_COLOS = ['NRT', 'KIX', 'FUK', 'OKA'];
 
-const blocker = {
-  keys: ['.m3u8', '.ts', '.acc', '.m4s', 'photocall.tv', 'googlevideo.com'],
-  check(url) {
-    url = url.toLowerCase();
-    return blocker.keys.some((x) => url.includes(x));
-  },
-};
-
 const CONFIG = {
-  pikpakProxyUrl: 'https://pp.255432.xyz',
   enableStats: true,
-  cacheEnabled: true,
 };
-
-const PIKPAK_DOMAINS = [
-  'pikpak.com', 'pikpak.net', 'pikpak-cn.com', 'pikpakcdn.com', 'pikpakapi.com', 'pikpakdrive.com',
-];
 
 const CORS_JSON = { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' };
 
@@ -299,7 +285,7 @@ async function createOrUpdateDNSRecord(env, zoneId, dnsName, targetDomain) {
     name: dnsName,
     content: targetDomain,
     ttl: 1,
-    proxied: true,
+    proxied: false,
   };
   
   let result;
@@ -489,14 +475,6 @@ async function handleAdminApi(request, env, url) {
     }
   }
 
-  if (url.pathname === '/api/config/dns-record-name') {
-      return json({ dnsRecordName: env.DNS_RECORD_NAME || 'emby' });
-    }
-    
-    if (url.pathname === '/api/config/base-domain') {
-      return json({ baseDomain: env.BASE_DOMAIN || 'yourdomain.com' });
-    }
-
   if (url.pathname === '/admin/api/dns-config') {
     if (request.method === 'GET') {
       const config = await getDNSConfig(env);
@@ -525,7 +503,7 @@ async function handleAdminApi(request, env, url) {
     const data = await request.json();
     const { zoneId, dnsName, targetDomain } = data;
     
-    if (!zoneId || !dnsName || !targetDomain) {
+    if (!dnsName || !targetDomain) {
       return json({ success: false, error: '缺少必要参数' });
     }
     
@@ -550,14 +528,24 @@ async function resolveProxyTarget(request, env, url) {
 
   const enableCache = route.cache_img !== 'off';
   const compatMode = route.compat_mode === 'on';
-  const remainingPath = '/' + pathParts.slice(1).join('/');
+  const remainingSegments = pathParts.slice(1).join('/');
   const targetUrls = route.target.split(',').map(s => s.trim()).filter(Boolean);
 
   let upstreamUrls = [];
-  if (remainingPath.startsWith('/http://') || remainingPath.startsWith('/https://')) {
-    upstreamUrls = [remainingPath.substring(1) + url.search];
-  } else {
-    upstreamUrls = targetUrls.map(t => t.replace(/\/+$/, '') + remainingPath + url.search);
+  for (const target of targetUrls) {
+    try {
+      const t = new URL(target);
+      const port = t.port || (t.protocol === 'https:' ? '443' : '80');
+      const scheme = t.protocol.replace(':', '');
+      let path = t.hostname + ':' + port;
+      if (remainingSegments) path += '/' + remainingSegments;
+      if (url.search) path += url.search;
+      const parsed = new URL(scheme + '://' + path);
+      upstreamUrls.push(parsed.toString());
+    } catch {
+      const suffix = remainingSegments ? '/' + remainingSegments : '';
+      upstreamUrls.push(target.replace(/\/+$/, '') + suffix + url.search);
+    }
   }
 
   return { upstreamUrls, enableCache, compatMode, matchedPrefix: route.prefix };
@@ -569,7 +557,6 @@ function normalizeAlias(a) {
 
 async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
   const { enableCache = true, compatMode = false, matchedPrefix = null } = opts;
-  const proxyOrigin = new URL(request.url).origin;
 
   if (!upstreamUrls.length) return new Response('404: Target empty', { status: 404 });
 
@@ -583,12 +570,8 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
   const isPlaybackInfo = /\/PlaybackInfo/i.test(firstUpstreamUrl.pathname);
   const isPlaying = firstUpstreamUrl.pathname.endsWith('/Sessions/Playing');
 
-  if (isPlaying && CONFIG.enableStats) {
-    ctx.waitUntil(recordStats(env, 'playing'));
-  }
-  if (isPlaybackInfo) {
-    ctx.waitUntil(recordStats(env, 'playback_info'));
-  }
+  if (isPlaying && CONFIG.enableStats) ctx.waitUntil(recordStats(env, 'playing'));
+  if (isPlaybackInfo) ctx.waitUntil(recordStats(env, 'playback_info'));
 
   if (matchedPrefix && env.DB && ctx?.waitUntil && isPlaybackInfo) {
     const todayStr = new Date(Date.now() + 8 * 3600000).toISOString().split('T')[0];
@@ -628,11 +611,6 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
       continue;
     }
 
-    if (PIKPAK_DOMAINS.some((d) => upstreamUrl.hostname.endsWith(d))) {
-      return Response.redirect(new URL(upstreamUrl.pathname + upstreamUrl.search, CONFIG.pikpakProxyUrl).toString(), 301);
-    }
-    if (blocker.check(upstreamUrl.toString())) return Response.redirect('https://baidu.com', 301);
-
     const colo = request.cf?.colo;
     if (colo && JP_COLOS.includes(colo)) {
       for (const suffix in DOMAIN_PROXY_RULES) {
@@ -657,11 +635,11 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
       headers.set('X-Forwarded-Host', upstreamUrl.host);
     }
 
-    const isStaticOrImage = /\.(jpg|jpeg|gif|png|svg|ico|webp|js|css|woff2?|ttf|otf|map|webmanifest|srt|ass|vtt|sub)$/i.test(upstreamUrl.pathname) ||
-      /(\/Images\/|\/Icons\/|\/Branding\/|\/emby\/covers\/)/i.test(upstreamUrl.pathname);
-
-    const fetchInit = { method: request.method, headers, redirect: compatMode ? 'follow' : 'manual' };
-    if (isStaticOrImage && enableCache) fetchInit.cf = { cacheEverything: true, cacheTtl: 86400 };
+    const fetchInit = {
+      method: request.method,
+      headers,
+      redirect: compatMode ? 'follow' : 'manual',
+    };
     if (requestBody) fetchInit.body = requestBody;
 
     try {
@@ -683,111 +661,45 @@ async function proxyDirectUrl(request, env, ctx, upstreamUrls, opts = {}) {
     return new Response('所有线路不可用: ' + (lastError?.message || 'Unknown'), { status: 502 });
   }
 
-  const safePrefix = matchedPrefix ? `/${matchedPrefix}` : '';
-
   if (!compatMode) {
     const location = finalResponse.headers.get('Location');
     if (location && finalResponse.status >= 300 && finalResponse.status < 400) {
-      try {
-        const redirectUrl = new URL(location, lastUpstreamUrl);
-        if (redirectUrl.hostname === lastUpstreamUrl.hostname) {
-          return fetch(redirectUrl.toString(), new Request(redirectUrl, { method: request.method, headers: finalResponse.headers, redirect: 'follow' }));
-        }
-        if (MANUAL_REDIRECT_DOMAINS.some((d) => redirectUrl.hostname.endsWith(d))) {
-          const rh = new Headers(finalResponse.headers);
-          rh.set('Location', redirectUrl.toString());
-          return new Response(finalResponse.body, { status: finalResponse.status, headers: rh });
-        }
-        if (matchedPrefix) {
-          const rh = new Headers(finalResponse.headers);
-          rh.set('Location', `${safePrefix}/${encodeURIComponent(redirectUrl.toString())}`);
-          return new Response(finalResponse.body, { status: finalResponse.status, headers: rh });
-        }
-        const fh = new Headers(request.headers);
-        fh.set('Host', redirectUrl.host);
-        fh.delete('Referer');
-        const cIp = request.headers.get('cf-connecting-ip');
-        if (cIp) {
-          fh.set('x-forwarded-for', cIp);
-          fh.set('x-real-ip', cIp);
-        }
-        return fetch(redirectUrl.toString(), { method: request.method, headers: fh, body: requestBody || undefined, redirect: 'follow' });
-      } catch (_) {}
+      const redirectUrl = new URL(location, lastUpstreamUrl);
+
+      if (MANUAL_REDIRECT_DOMAINS.some(domain => redirectUrl.hostname.endsWith(domain))) {
+        const newHeaders = new Headers(finalResponse.headers);
+        newHeaders.set('Location', redirectUrl.toString());
+        return new Response(finalResponse.body, { status: finalResponse.status, headers: newHeaders });
+      }
+
+      const newReqHeaders = new Headers(request.headers);
+      newReqHeaders.set('Host', redirectUrl.host);
+      newReqHeaders.delete('Referer');
+      const cIp = request.headers.get('cf-connecting-ip');
+      if (cIp) {
+        newReqHeaders.set('x-forwarded-for', cIp);
+        newReqHeaders.set('x-real-ip', cIp);
+      }
+
+      return fetch(redirectUrl.toString(), {
+        method: request.method,
+        headers: newReqHeaders,
+        body: requestBody || undefined,
+        redirect: 'follow',
+      });
     }
   }
 
   const responseHeaders = new Headers(finalResponse.headers);
-  const contentType = finalResponse.headers.get('content-type') || '';
-
-  if (!compatMode && finalResponse.status === 200 && contentType.includes('json') && matchedPrefix) {
-    const urlPath = lastUpstreamUrl.pathname.toLowerCase();
-    if (urlPath.includes('playbackinfo')) {
-      try {
-        const data = await finalResponse.clone().json();
-        let modified = false;
-        if (data?.MediaSources) {
-          data.MediaSources.forEach((source) => {
-            ['DirectStreamUrl', 'TranscodingUrl'].forEach((key) => {
-              if (source[key]?.startsWith('http')) {
-                try {
-                  const mediaUrl = new URL(source[key]);
-                  const isDirectDomain = MANUAL_REDIRECT_DOMAINS.some(d => mediaUrl.hostname.endsWith(d));
-                  if (!isDirectDomain) {
-                    source[key] = proxyOrigin + safePrefix + '/' + source[key];
-                    modified = true;
-                  }
-                } catch (_) {
-                  source[key] = proxyOrigin + safePrefix + '/' + source[key];
-                  modified = true;
-                }
-              }
-            });
-          });
-        }
-        if (modified) {
-          responseHeaders.delete('Content-Length');
-          return new Response(JSON.stringify(data), { status: finalResponse.status, headers: responseHeaders });
-        }
-      } catch (_) {}
-    }
-  }
-
-  if (!compatMode && finalResponse.status === 200 && matchedPrefix) {
-    const urlPath = lastUpstreamUrl.pathname.toLowerCase();
-    if (urlPath.endsWith('.m3u8')) {
-      try {
-        const text = await finalResponse.clone().text();
-        if (text.includes('http://') || text.includes('https://')) {
-          const modifiedText = text.replace(/(https?:[^\s]+)/g, (match) => {
-            try {
-              const mUrl = new URL(match);
-              const isDirectDomain = MANUAL_REDIRECT_DOMAINS.some(d => mUrl.hostname.endsWith(d));
-              return isDirectDomain ? match : proxyOrigin + safePrefix + '/' + match;
-            } catch (_) {
-              return proxyOrigin + safePrefix + '/' + match;
-            }
-          });
-          responseHeaders.delete('Content-Length');
-          return new Response(modifiedText, { status: finalResponse.status, headers: responseHeaders });
-        }
-      } catch (_) {}
-    }
-  }
-
-  if (CONFIG.cacheEnabled) {
-    if (contentType.includes('image/') || contentType.includes('text/css') || contentType.includes('application/javascript')) {
-      responseHeaders.set('Cache-Control', 'public, max-age=86400');
-    } else if (contentType.includes('video/') || contentType.includes('audio/')) {
-      responseHeaders.set('Cache-Control', 'public, max-age=3600');
-    } else {
-      responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    }
-  }
-
   responseHeaders.set('Access-Control-Allow-Origin', '*');
   responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   responseHeaders.set('Access-Control-Allow-Headers', '*');
-  responseHeaders.set('X-Content-Type-Options', 'nosniff');
+  responseHeaders.delete('Content-Security-Policy');
+  responseHeaders.delete('X-Frame-Options');
+
+  if (isPlaying || isPlaybackInfo) {
+    responseHeaders.set('X-Served-By', request.cf?.colo || 'Unknown');
+  }
 
   return new Response(finalResponse.body, {
     status: finalResponse.status,
@@ -886,6 +798,13 @@ const PAGE_STYLE = `
   .domain-name { font-weight: 600; color: #f1f5f9; }
   .domain-url { color: #94a3b8; font-size: 13px; }
   .domain-actions { display: flex; gap: 8px; }
+  .dns-current-config { display: flex; align-items: center; justify-content: space-between; padding: 16px; background: rgba(15, 23, 42, 0.6); border: 2px solid rgba(148, 163, 184, 0.2); border-radius: 12px; margin-bottom: 16px; }
+  .dns-record-display { display: flex; align-items: center; gap: 12px; flex: 1; }
+  .dns-record-name { font-weight: 700; color: #60a5fa; font-size: 1.1em; }
+  .dns-record-arrow { color: #94a3b8; font-size: 1.2em; }
+  .dns-record-target { color: #f1f5f9; font-weight: 600; font-size: 1.1em; }
+  .btn-edit { background: rgba(96, 165, 250, 0.15); border: 1px solid rgba(96, 165, 250, 0.3); color: #93c5fd; box-shadow: none; }
+  .btn-edit:hover { background: rgba(96, 165, 250, 0.25); }
 `;
 
 function buildFrontendHtml() {
@@ -1211,10 +1130,16 @@ function buildAdminHtml() {
       <p class="modal-desc">将最优域名配置到您的 DNS 记录</p>
     </div>
     <div class="form-group">
-      <label>选择区域 (Zone)</label>
-      <select id="dnsZone">
-        <option value="">加载中...</option>
-      </select>
+      <label>当前配置DNS记录</label>
+      <div id="dnsCurrentConfig" class="dns-current-config">
+        <div class="dns-record-display">
+          <span id="dnsCurrentName" class="dns-record-name">加载中...</span>
+          <span class="dns-record-arrow">→</span>
+          <span id="dnsCurrentTarget" class="dns-record-target">加载中...</span>
+        </div>
+        <button class="btn btn-edit btn-sm" onclick="editDNSConfig()">✏️ 编辑</button>
+      </div>
+      <input type="hidden" id="dnsZone" value="">
     </div>
     <div class="form-group">
       <label>DNS 名称</label>
@@ -1516,11 +1441,12 @@ function renderDNSConfig(config, zones, zonesError, baseDomain) {
   }
   
   if (zones && zones.length) {
-    html += '<div class="form-group"><label>可用区域</label><select id="zoneSelect">';
+    html += '<div class="form-group"><label>当前配置DNS记录</label>';
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
     zones.forEach(z => {
-      html += '<option value="' + z.id + '">' + z.name + '</option>';
+      html += '<span style="padding:6px 12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;font-size:14px">' + z.name + '</span>';
     });
-    html += '</select></div>';
+    html += '</div></div>';
   } else if (!zonesError) {
     html += '<p class="muted">未找到可用区域，请确认 CF_API_TOKEN 有 Zone:Read 权限</p>';
   }
@@ -1555,18 +1481,54 @@ async function openDNSModal() {
   const r = await fetch('/admin/api/dns-config');
   const d = await r.json();
   
-  if (d.success && d.zones && d.zones.length) {
-    const zoneSelect = document.getElementById('dnsZone');
-    zoneSelect.innerHTML = d.zones.map(z => '<option value="' + z.id + '">' + z.name + '</option>').join('');
+  const baseDomainResp = await fetch('/api/config/base-domain');
+  const baseDomainData = await baseDomainResp.json();
+  const baseDomain = baseDomainData.baseDomain || 'yourdomain.com';
+  
+  const dnsCurrentName = document.getElementById('dnsCurrentName');
+  const dnsCurrentTarget = document.getElementById('dnsCurrentTarget');
+  const dnsZone = document.getElementById('dnsZone');
+  
+  if (d.success && d.config && d.config.dnsName) {
+    dnsCurrentName.textContent = d.config.dnsName + '.' + baseDomain;
+    dnsCurrentTarget.textContent = d.config.currentDomain || '未设置';
+    dnsZone.value = d.config.zoneId || '';
+  } else {
+    dnsCurrentName.textContent = '未配置';
+    dnsCurrentTarget.textContent = '未设置';
   }
   
   const dnsNameConfig = await fetch('/api/config/dns-record-name');
   const dnsNameData = await dnsNameConfig.json();
-  document.getElementById('dnsName').value = dnsConfig?.dnsName || dnsNameData.dnsRecordName || 'emby';
+  document.getElementById('dnsName').value = d.config?.dnsName || dnsNameData.dnsRecordName || 'emby';
   document.getElementById('dnsTarget').value = bestDomain.domain;
-  document.getElementById('dnsPreview').textContent = (dnsConfig?.dnsName || dnsNameData.dnsRecordName || 'emby') + '.' + (await fetch('/api/config/base-domain')).then(r=>r.json()).then(d=>d.baseDomain || 'yourdomain.com');
+  document.getElementById('dnsPreview').textContent = (d.config?.dnsName || dnsNameData.dnsRecordName || 'emby') + '.' + baseDomain;
   
   openModal('modalDNS');
+}
+
+function editDNSConfig() {
+  const dnsCurrentName = document.getElementById('dnsCurrentName');
+  const dnsCurrentTarget = document.getElementById('dnsCurrentTarget');
+  
+  const currentName = dnsCurrentName.textContent;
+  const currentTarget = dnsCurrentTarget.textContent;
+  
+  if (currentName === '未配置') {
+    showToast('当前没有配置DNS记录');
+    return;
+  }
+  
+  const nameParts = currentName.split('.');
+  if (nameParts.length >= 2) {
+    document.getElementById('dnsName').value = nameParts[0];
+  }
+  
+  if (currentTarget !== '未设置') {
+    document.getElementById('dnsTarget').value = currentTarget;
+  }
+  
+  showToast('已加载当前配置，可以修改后替换');
 }
 
 async function replaceDNS() {
@@ -1574,7 +1536,6 @@ async function replaceDNS() {
   const dnsName = document.getElementById('dnsName').value.trim();
   const targetDomain = document.getElementById('dnsTarget').value.trim();
   
-  if (!zoneId) { showToast('请选择区域'); return; }
   if (!dnsName) { showToast('请输入DNS名称'); return; }
   if (!targetDomain) { showToast('请输入目标域名'); return; }
   
@@ -1676,6 +1637,14 @@ export default {
         return json({ cached: false, edge: true, best: data.best, results: data.results });
       }
       return json({ cached: false, results: [] });
+    }
+
+    if (url.pathname === '/api/config/dns-record-name') {
+      return json({ dnsRecordName: env.DNS_RECORD_NAME || 'emby' });
+    }
+
+    if (url.pathname === '/api/config/base-domain') {
+      return json({ baseDomain: env.BASE_DOMAIN || 'yourdomain.com' });
     }
 
     if (url.pathname === '/admin/api/login' && request.method === 'POST') {
