@@ -25,6 +25,8 @@
 | 🛡️ 安全防护 | 管理后台密码保护、PikPak 域名自动重定向、恶意请求拦截 |
 | 🎨 现代化 UI | 深蓝渐变风格管理后台，卡片式路由管理 |
 | 💾 D1 数据库 | 数据持久化存储，自动建表，无需手动初始化 |
+| 🔌 WebSocket 支持 | 完整支持 WebSocket 代理，满足实时通信需求 |
+| 🌍 全球加速 | 利用 Cloudflare 全球边缘节点，就近访问加速 |
 
 ---
 
@@ -94,15 +96,17 @@ https://emby1.example.com:8096,https://emby2.example.com:8096
 | `CF_API_TOKEN` | ❌ | Cloudflare API Token（用于 DNS 一键配置） |
 | `CF_ZONE_ID` | ❌ | Cloudflare Zone ID（用于 DNS 一键配置） |
 | `CF_ACCOUNT_ID` | ❌ | Cloudflare Account ID（用于获取 Zone 列表） |
+| `DNS_RECORD_NAME` | ❌ | DNS 记录名称（默认: `emby`） |
 
 ### 获取 Cloudflare API Token
 
 1. 登录 Cloudflare Dashboard
 2. 右上角头像 → 我的个人资料 → API 令牌
 3. 创建令牌，权限配置：
+   - **Account - Workers Scripts - Edit**
+   - **Account - D1 - Edit**
    - **Zone - Zone Settings - Read**
    - **Zone - DNS - Edit**
-   - **Account - Workers Scripts - Edit**
 
 ---
 
@@ -119,13 +123,16 @@ https://emby1.example.com:8096,https://emby2.example.com:8096
 
 ## 📝 更新日志
 
-### v3.3 (2026-05)
+### v3.3-enhanced (2026-05)
 
 - 🌐 新增优选域名管理功能，内置域名可编辑删除
 - ⚡ 边缘节点 + 本地网络双重重测速
 - 🔄 DNS 一键配置功能，测速完成后自动替换 DNS 记录
 - 🎨 合并优选域名列表和测速结果为统一表格
 - 💾 自动建表，D1 数据库初始化
+- 🔌 完整 WebSocket 代理支持
+- 🛡️ 增强安全防护，支持 PikPak 域名自动重定向
+- 📊 改进使用统计，支持按天查看播放和链接获取次数
 
 ---
 
